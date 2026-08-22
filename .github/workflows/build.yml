@@ -3,6 +3,10 @@ name: Build
 # Any code update triggers a build. Manual runs are also handy.
 on:
   push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -60,3 +64,38 @@ jobs:
           name: DomainCheck-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
           if-no-files-found: error
+
+  release:
+    name: Publish to Releases
+    needs: build
+    runs-on: ubuntu-latest
+    # Versioned releases for v* tags; a rolling "latest" prerelease that is
+    # refreshed on every main-branch build so binaries are always downloadable.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum DomainCheck-* > SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # v* tags publish under their own tag; main keeps a single
+          # rolling "latest" prerelease that gets overwritten each build.
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('DomainCheck {0}', github.ref_name) || 'Latest build (main)' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          generate_release_notes: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            dist/DomainCheck-*
+            dist/SHA256SUMS.txt

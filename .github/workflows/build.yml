@@ -69,7 +69,7 @@ jobs:
     name: Publish to Releases
     needs: build
     runs-on: ubuntu-latest
-    # Versioned releases for v* tags; a rolling "latest" prerelease that is
+    # Versioned releases for v* tags; a rolling "latest" release that is
     # refreshed on every main-branch build so binaries are always downloadable.
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
     permissions:
@@ -94,7 +94,7 @@ jobs:
           # rolling "latest" prerelease that gets overwritten each build.
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && format('DomainCheck {0}', github.ref_name) || 'Latest build (main)' }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          prerelease: false
           generate_release_notes: ${{ startsWith(github.ref, 'refs/tags/v') }}
           files: |
             dist/DomainCheck-*

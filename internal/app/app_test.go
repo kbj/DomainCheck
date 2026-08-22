@@ -681,22 +681,25 @@ func TestResultAndStateDirsAutoCreated(t *testing.T) {
 }
 
 func TestInterQueryDelay(t *testing.T) {
-	// Pure-DNS verdicts: fixed 500ms, no jitter.
-	for i := 0; i < 20; i++ {
-		if d := interQueryDelay(false, 10); d != 500*time.Millisecond {
-			t.Fatalf("dns path must be exactly 0.5s, got %v", d)
+	// Pure-DNS verdicts: exactly the configured interval, never jittered.
+	for _, iv := range []time.Duration{100 * time.Millisecond, time.Second, 3 * time.Second} {
+		for i := 0; i < 20; i++ {
+			if d := interQueryDelay(false, 10, iv); d != iv {
+				t.Fatalf("dns path must equal -dns-interval verbatim: want %v got %v", iv, d)
+			}
 		}
 	}
 	// Whois path with delay=0: no wait (original tool behavior preserved).
-	if d := interQueryDelay(true, 0); d != 0 {
+	if d := interQueryDelay(true, 0, time.Second); d != 0 {
 		t.Fatalf("whois path delay=0 should be 0, got %v", d)
 	}
-	// Whois path with configured delay: jittered around it.
+	// Whois path with configured delay: jittered around it; dns interval
+	// value must not leak into the whois path.
 	low, high := 3*time.Second, 5*time.Second
 	sawVariation := false
 	var last time.Duration
 	for i := 0; i < 200; i++ {
-		d := interQueryDelay(true, 4)
+		d := interQueryDelay(true, 4, time.Second)
 		if d < low || d > high {
 			t.Fatalf("whois delay %v outside [%v,%v]", d, low, high)
 		}

@@ -45,7 +45,7 @@ func main() {
 		retries     = flag.Int("retries", 3, "WHOIS retries per query after the first attempt")
 		interval    = flag.Duration("interval", 10*time.Second, "WHOIS retry interval (exponential backoff base)")
 		dnsRetries  = flag.Int("dns-retries", 1, "DNS lookup retries after the first attempt")
-		dnsInterval = flag.Duration("dns-interval", time.Second, "DNS retry interval (exponential backoff base, min 100ms)")
+		dnsInterval = flag.Duration("dns-interval", time.Second, "pause between pure-DNS verdicts / DNS retry backoff base (min 100ms)")
 		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for both retry backoffs")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)

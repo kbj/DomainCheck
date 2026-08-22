@@ -531,7 +531,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		// Inter-query pacing depends on where the next request will go:
 		// pure DNS judgments keep a small fixed gap; the configured (and
 		// jittered) delay only applies when a WHOIS server was involved.
-		wait := interQueryDelay(usedWhois, task.DelaySeconds)
+		wait := interQueryDelay(usedWhois, task.DelaySeconds, opts.DNS.BaseDelay)
 		if wait <= 0 {
 			continue
 		}
@@ -596,23 +596,18 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	return nil
 }
 
-// dnsQueryDelay is the fixed pause between two consecutive domains that
-// were judged purely via DNS NS records: DNS resolvers are shared
-// infrastructure and tolerate this pace regardless of -delay.
-const dnsQueryDelay = 500 * time.Millisecond
-
-// interQueryDelay picks the wait before the next domain: a fixed 0.5s for
-// pure-DNS verdicts, or the configured (jittered) delay when the WHOIS
-// server was involved. A configured delay of 0 still yields no wait on the
-// whois path, preserving the original tool's behavior.
-func interQueryDelay(usedWhois bool, delaySecs int) time.Duration {
+// interQueryDelay picks the wait before the next domain: the configured
+// DNS interval (fixed, no jitter) for pure-DNS verdicts, or the configured
+// jittered delay when the WHOIS server was involved. A whois delay of 0
+// still yields no wait, preserving the original tool's behavior.
+func interQueryDelay(usedWhois bool, whoisSecs int, dnsInterval time.Duration) time.Duration {
 	if !usedWhois {
-		return dnsQueryDelay
+		return dnsInterval
 	}
-	if delaySecs <= 0 {
+	if whoisSecs <= 0 {
 		return 0
 	}
-	return jitteredDelay(time.Duration(delaySecs) * time.Second)
+	return jitteredDelay(time.Duration(whoisSecs) * time.Second)
 }
 
 // jitteredDelay randomizes the inter-query wait around the configured base:

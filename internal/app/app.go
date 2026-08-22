@@ -421,13 +421,16 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	// checkDomain runs the full pipeline for one domain and reports its
 	// outcome. Returns false when the context was cancelled mid-flight
 	// (caller stops the loop without recording anything).
-	checkDomain := func(i int, domain string) bool {
+	// checkDomain runs one domain through DNS pre-check + WHOIS. It returns
+	// (ok, usedWhois): ok=false means ctx was cancelled mid-flight and
+	// nothing was recorded; usedWhois drives which inter-query delay applies.
+	checkDomain := func(i int, domain string) (bool, bool) {
 		// Step 1: DNS NS pre-check.
 		hasNS, dnsKnown := false, false
 		nsHit, nsErr := nsChecker.HasNS(ctx, domain)
 		if nsErr != nil {
 			if ctx.Err() != nil { // Ctrl+C during the lookup
-				return false
+				return false, false
 			}
 			eprintf("WARN dns lookup failed for %s: %v", domain, nsErr)
 		} else {
@@ -448,7 +451,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		if hasNS {
 			printf("%s is NOT available [dns]", domain)
 			persist(state.StatusUnavailableDNS, "")
-			return true
+			return true, false
 		}
 
 		// Step 2: WHOIS — skipped entirely when disabled/unconfigured.
@@ -456,18 +459,18 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			if !dnsKnown {
 				eprintf("WARN %s cannot be judged (dns lookup failed, whois disabled)", domain)
 				persist(state.StatusFailed, "dns lookup failed and whois is disabled")
-				return true
+				return true, false
 			}
 			printf("%s is available [dns, uncertain]", domain)
 			fmt.Fprintf(logFile, "%s is available [dns]\n", domain)
 			logFile.Flush()
 			persist(state.StatusAvailableDNS, "")
-			return true
+			return true, false
 		}
 
 		resp, qerr := client.Query(ctx, domain, task.NIC)
 		if qerr != nil && ctx.Err() != nil { // Ctrl+C during the query
-			return false
+			return false, false
 		}
 		if qerr != nil {
 			// Retries exhausted against this server. Hammering it further
@@ -493,7 +496,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 				// Even DNS was unreachable: retryable on resume.
 				persist(state.StatusFailed, qerr.Error())
 			}
-			return true
+			return true, true // the whois server WAS contacted (that's why we degraded)
 		}
 
 		if strings.Contains(strings.ToLower(resp), strings.ToLower(task.ResponseMark)) {
@@ -505,7 +508,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			printf("%s is NOT available", domain)
 			persist(state.StatusUnavailable, "")
 		}
-		return true
+		return true, true // authoritative answer from the whois server
 	}
 
 	for i := sess.Start; i < task.Total; i++ {
@@ -520,20 +523,30 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		}
 
 		domain := prefixes[i] + "." + task.TLD
-		if !checkDomain(i, domain) {
+		ok, usedWhois := checkDomain(i, domain)
+		if !ok {
 			interrupted = true
 			break
 		}
 
-		if task.DelaySeconds > 0 && i < task.Total-1 {
-			select {
-			case <-ctx.Done():
-				interrupted = true
-			case <-time.After(jitteredDelay(time.Duration(task.DelaySeconds) * time.Second)):
-			}
-			if interrupted {
-				break
-			}
+		if i == task.Total-1 {
+			break // no further query to pace
+		}
+
+		// Inter-query pacing depends on where the next request will go:
+		// pure DNS judgments keep a small fixed gap; the configured (and
+		// jittered) delay only applies when a WHOIS server was involved.
+		wait := interQueryDelay(usedWhois, task.DelaySeconds)
+		if wait <= 0 {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			interrupted = true
+		case <-time.After(wait):
+		}
+		if interrupted {
+			break
 		}
 	}
 
@@ -586,6 +599,25 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		printf("Re-run with -resume=%s to retry only those.", task.MetaPath())
 	}
 	return nil
+}
+
+// dnsQueryDelay is the fixed pause between two consecutive domains that
+// were judged purely via DNS NS records: DNS resolvers are shared
+// infrastructure and tolerate this pace regardless of -delay.
+const dnsQueryDelay = 500 * time.Millisecond
+
+// interQueryDelay picks the wait before the next domain: a fixed 0.5s for
+// pure-DNS verdicts, or the configured (jittered) delay when the WHOIS
+// server was involved. A configured delay of 0 still yields no wait on the
+// whois path, preserving the original tool's behavior.
+func interQueryDelay(usedWhois bool, delaySecs int) time.Duration {
+	if !usedWhois {
+		return dnsQueryDelay
+	}
+	if delaySecs <= 0 {
+		return 0
+	}
+	return jitteredDelay(time.Duration(delaySecs) * time.Second)
 }
 
 // jitteredDelay randomizes the inter-query wait around the configured base:

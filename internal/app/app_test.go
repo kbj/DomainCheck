@@ -666,3 +666,33 @@ func TestResultAndStateDirsAutoCreated(t *testing.T) {
 		t.Fatalf("result/ should keep the log")
 	}
 }
+
+func TestInterQueryDelay(t *testing.T) {
+	// Pure-DNS verdicts: fixed 500ms, no jitter.
+	for i := 0; i < 20; i++ {
+		if d := interQueryDelay(false, 10); d != 500*time.Millisecond {
+			t.Fatalf("dns path must be exactly 0.5s, got %v", d)
+		}
+	}
+	// Whois path with delay=0: no wait (original tool behavior preserved).
+	if d := interQueryDelay(true, 0); d != 0 {
+		t.Fatalf("whois path delay=0 should be 0, got %v", d)
+	}
+	// Whois path with configured delay: jittered around it.
+	low, high := 3*time.Second, 5*time.Second
+	sawVariation := false
+	var last time.Duration
+	for i := 0; i < 200; i++ {
+		d := interQueryDelay(true, 4)
+		if d < low || d > high {
+			t.Fatalf("whois delay %v outside [%v,%v]", d, low, high)
+		}
+		if last != 0 && d != last {
+			sawVariation = true
+		}
+		last = d
+	}
+	if !sawVariation {
+		t.Fatal("whois delay should vary (jitter)")
+	}
+}

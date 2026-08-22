@@ -18,9 +18,9 @@ const (
 	// DefaultTimeout is the default per-attempt deadline.
 	DefaultTimeout = 10 * time.Second
 	// DefaultMaxRetries is the number of retries after the initial attempt.
-	DefaultMaxRetries = 4
+	DefaultMaxRetries = 3
 	// DefaultBaseDelay is the backoff delay before the first retry.
-	DefaultBaseDelay = 1 * time.Second
+	DefaultBaseDelay = 10 * time.Second
 	// DefaultMaxDelay caps the exponential backoff delay.
 	DefaultMaxDelay = 60 * time.Second
 

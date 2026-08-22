@@ -106,10 +106,12 @@ bai.xyz is NOT available #不可注册的域名
 | `-delay` | **WHOIS 查询**间隔（秒），默认 0；实际等待在设定值附近随机抖动 ±25%。纯 DNS 判定的域名之间固定间隔 0.5s，不受此参数影响 |
 | `-resume` | 续扫：`latest` 为最近一个未完成任务，或指定 `.state.json` 路径 |
 | `-data` | 数据目录（含 `tld.json`、`dict/`、`result/`），默认当前目录 |
-| `-timeout` | 单次 WHOIS 查询超时（默认 10s） |
-| `-retries` | 每个域名的额外重试次数（默认 4，即最多尝试 5 次） |
-| `-base-backoff` | 首次重试等待时长（默认 1s，之后逐次翻倍） |
-| `-max-backoff` | 重试等待上限（默认 60s） |
+| `-timeout` | 单次查询超时（WHOIS 与 DNS 共用，默认 10s） |
+| `-retries` | WHOIS 查询失败后的重试次数（默认 3，即最多尝试 4 次） |
+| `-interval` | WHOIS 重试间隔，指数退避基数（默认 10s，逐次翻倍） |
+| `-dns-retries` | DNS 查询失败后的重试次数（默认 1，即最多尝试 2 次） |
+| `-dns-interval` | DNS 重试间隔，指数退避基数（默认 1s，最小可设 0.1s） |
+| `-max-backoff` | 两类重试等待的上限（默认 60s） |
 | `-dns` | 自定义 DNS 解析器（host:port），用于 NS 预检 |
 | `-gen` / `-charset` / `-len` / `-out` | 字典生成模式及参数 |
 | `-list-tlds` / `-list-dicts` | 列出可用的后缀 / 字典 |

@@ -45,9 +45,9 @@ type Options struct {
 	ListTLDs  bool
 	ListDicts bool
 
-	// DNSServer optionally overrides the system resolver ("host:port",
-	// e.g. "1.1.1.1:53"). Empty means use the system configuration.
-	DNSServer string
+	// DNS configures the NS pre-check lookups (resolver override, retries,
+	// backoff). Zero fields fall back to package defaults.
+	DNS dns.Options
 	// ForceDNSOnly skips WHOIS entirely; set interactively after the user
 	// confirms an unconfigured TLD.
 	ForceDNSOnly bool
@@ -368,14 +368,9 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	warnOpts := opts.Whois
 	warnOpts.Logf = func(format string, args ...any) { eprintf("WARN "+format, args...) }
 	client := whois.NewClient(warnOpts)
-	nsChecker := dns.New(dns.Options{
-		Server:     opts.DNSServer,
-		Timeout:    warnOpts.Timeout,
-		MaxRetries: warnOpts.MaxRetries,
-		BaseDelay:  warnOpts.BaseDelay,
-		MaxDelay:   warnOpts.MaxDelay,
-		Logf:       func(format string, args ...any) { eprintf("WARN dns "+format, args...) },
-	})
+	dnsOpts := opts.DNS
+	dnsOpts.Logf = func(format string, args ...any) { eprintf("WARN dns "+format, args...) }
+	nsChecker := dns.New(dnsOpts)
 
 	if task.NIC == "" {
 		task.WhoisDisabled = true // task created without a WHOIS configuration

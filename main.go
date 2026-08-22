@@ -18,7 +18,10 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"time"
+
 	"github.com/uselibrary/DomainCheck/internal/app"
+	"github.com/uselibrary/DomainCheck/internal/dns"
 	"github.com/uselibrary/DomainCheck/internal/whois"
 )
 
@@ -38,10 +41,12 @@ func main() {
 		outName     = flag.String("out", "", "dictionary generator: output file name inside dict/")
 		listTLDs    = flag.Bool("list-tlds", false, "list TLDs from tld.json and exit")
 		listDicts   = flag.Bool("list-dicts", false, "list dictionaries in dict/ and exit")
-		timeout     = flag.Duration("timeout", whois.DefaultTimeout, "per-attempt WHOIS timeout")
-		retries     = flag.Int("retries", whois.DefaultMaxRetries, "retries per query after the first attempt")
-		baseBackoff = flag.Duration("base-backoff", whois.DefaultBaseDelay, "first retry delay (doubles each retry)")
-		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for retry delay")
+		timeout     = flag.Duration("timeout", whois.DefaultTimeout, "per-attempt timeout (WHOIS and DNS lookups)")
+		retries     = flag.Int("retries", 3, "WHOIS retries per query after the first attempt")
+		interval    = flag.Duration("interval", 10*time.Second, "WHOIS retry interval (exponential backoff base)")
+		dnsRetries  = flag.Int("dns-retries", 1, "DNS lookup retries after the first attempt")
+		dnsInterval = flag.Duration("dns-interval", time.Second, "DNS retry interval (exponential backoff base, min 100ms)")
+		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for both retry backoffs")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
@@ -67,15 +72,25 @@ func main() {
 	opts.Resume = *resume
 	opts.ListTLDs = *listTLDs
 	opts.ListDicts = *listDicts
-	opts.DNSServer = *dnsServer
 	opts.Gen = *genDict
 	opts.Charset = *charset
 	opts.WordLen = *wordLen
 	opts.OutName = *outName
+	if *dnsInterval < 100*time.Millisecond {
+		fmt.Fprintln(os.Stderr, "Error: -dns-interval must be at least 100ms")
+		os.Exit(2)
+	}
 	opts.Whois = whois.Options{
 		Timeout:    *timeout,
 		MaxRetries: *retries,
-		BaseDelay:  *baseBackoff,
+		BaseDelay:  *interval,
+		MaxDelay:   *maxBackoff,
+	}
+	opts.DNS = dns.Options{
+		Server:     *dnsServer,
+		Timeout:    *timeout,
+		MaxRetries: *dnsRetries,
+		BaseDelay:  *dnsInterval,
 		MaxDelay:   *maxBackoff,
 	}
 

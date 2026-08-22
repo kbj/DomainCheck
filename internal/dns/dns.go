@@ -15,8 +15,8 @@ import (
 
 const (
 	DefaultTimeout    = 5 * time.Second
-	DefaultMaxRetries = 2 // extra attempts after the first one
-	DefaultBaseDelay  = 300 * time.Millisecond
+	DefaultMaxRetries = 1 // extra attempts after the first one
+	DefaultBaseDelay  = 1 * time.Second
 	DefaultMaxDelay   = 5 * time.Second
 )
 

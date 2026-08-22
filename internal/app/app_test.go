@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uselibrary/DomainCheck/internal/dns"
 	"github.com/uselibrary/DomainCheck/internal/dns/dnstest"
 	"github.com/uselibrary/DomainCheck/internal/state"
 	"github.com/uselibrary/DomainCheck/internal/whois"
@@ -119,7 +120,13 @@ func testOptions(t *testing.T, dir string, behave func(string) string) (Options,
 		TLD:       "xyz",
 		DictName:  "test",
 		DelaySecs: 0,
-		DNSServer: dnsSrv.Addr(),
+		DNS: dns.Options{
+			Server:     dnsSrv.Addr(),
+			Timeout:    300 * time.Millisecond,
+			MaxRetries: 2,
+			BaseDelay:  5 * time.Millisecond,
+			MaxDelay:   15 * time.Millisecond,
+		},
 		Whois: whois.Options{
 			Port:       fw.port,
 			Timeout:    300 * time.Millisecond,
@@ -146,7 +153,13 @@ func newTestOptionsWithDNS(t *testing.T, dir string, behave func(string) string,
 		TLD:       "xyz",
 		DictName:  "test",
 		DelaySecs: 0,
-		DNSServer: dnsSrv.Addr(),
+		DNS: dns.Options{
+			Server:     dnsSrv.Addr(),
+			Timeout:    300 * time.Millisecond,
+			MaxRetries: 2,
+			BaseDelay:  5 * time.Millisecond,
+			MaxDelay:   15 * time.Millisecond,
+		},
 		Whois: whois.Options{
 			Port:       fw.port,
 			Timeout:    300 * time.Millisecond,

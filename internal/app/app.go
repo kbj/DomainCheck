@@ -434,12 +434,24 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	interrupted := false
 	degradedAnnounced := false
 
-	// checkDomain runs the full pipeline for one domain and reports its
-	// outcome. Returns false when the context was cancelled mid-flight
-	// (caller stops the loop without recording anything).
+	// lastWhoisDone records when the previous WHOIS query to the NIC
+	// completed (zero value means no WHOIS has run yet this session). It
+	// drives the pre-query "makeup wait": instead of sleeping a fixed
+	// -delay after every WHOIS query, the next WHOIS query is paced
+	// relative to this timestamp so that DNS pre-checks and DNS-only
+	// verdicts that ran in between overlap the WHOIS cooldown rather than
+	// stacking on top of it. In-memory only; a fresh resume starts with no
+	// history (resumes are typically long after the last query anyway).
+	var lastWhoisDone time.Time
+
 	// checkDomain runs one domain through DNS pre-check + WHOIS. It returns
 	// (ok, usedWhois): ok=false means ctx was cancelled mid-flight and
-	// nothing was recorded; usedWhois drives which inter-query delay applies.
+	// nothing was recorded; usedWhois=false means the verdict came purely
+	// from DNS (NS hit, or WHOIS disabled) and the caller paces with the
+	// small -dns-interval; usedWhois=true means the WHOIS server was
+	// contacted, in which case WHOIS rate limiting is already enforced as a
+	// pre-query makeup wait inside this function and the caller does NOT
+	// add another post-query sleep.
 	checkDomain := func(i int, domain string) (bool, bool) {
 		// Step 1: DNS NS pre-check.
 		hasNS, dnsKnown := false, false
@@ -484,7 +496,22 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			return true, false
 		}
 
+		// WHOIS rate limiting is a pre-query makeup wait, not a post-query
+		// fixed sleep: pace this query relative to when the previous WHOIS
+		// query completed, so the DNS pre-check above and any DNS-only
+		// verdicts since the last WHOIS overlap the cooldown instead of
+		// being serialized after it. The target gap is jittered per query
+		// (same ±25% scheme as before); only the residual is slept.
+		if wait := whoisMakeupWait(lastWhoisDone, time.Duration(task.DelaySeconds)*time.Second); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return false, false
+			case <-time.After(wait):
+			}
+		}
+
 		resp, qerr := client.Query(ctx, domain, task.NIC)
+		lastWhoisDone = time.Now() // a WHOIS request was issued; pace the next one off this
 		if qerr != nil && ctx.Err() != nil { // Ctrl+C during the query
 			return false, false
 		}
@@ -546,23 +573,26 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		}
 
 		if i == task.Total-1 {
-			break // no further query to pace
+			break // last domain: nothing left to pace
 		}
 
-		// Inter-query pacing depends on where the next request will go:
-		// pure DNS judgments keep a small fixed gap; the configured (and
-		// jittered) delay only applies when a WHOIS server was involved.
-		wait := interQueryDelay(usedWhois, task.DelaySeconds, opts.DNS.BaseDelay)
-		if wait <= 0 {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			interrupted = true
-		case <-time.After(wait):
-		}
-		if interrupted {
-			break
+		// Post-query pacing only applies to DNS-only verdicts: a small fixed
+		// gap keeps the DNS resolver from being hammered. When the WHOIS
+		// server was involved there is no post-query sleep here — WHOIS
+		// rate limiting is enforced as a pre-query makeup wait inside
+		// checkDomain, so the next domain's DNS pre-check starts right away
+		// and overlaps the WHOIS cooldown instead of stacking on top of it.
+		if !usedWhois {
+			if wait := opts.DNS.BaseDelay; wait > 0 {
+				select {
+				case <-ctx.Done():
+					interrupted = true
+				case <-time.After(wait):
+				}
+				if interrupted {
+					break
+				}
+			}
 		}
 	}
 
@@ -617,18 +647,28 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	return nil
 }
 
-// interQueryDelay picks the wait before the next domain: the configured
-// DNS interval (fixed, no jitter) for pure-DNS verdicts, or the configured
-// jittered delay when the WHOIS server was involved. A whois delay of 0
-// still yields no wait, preserving the original tool's behavior.
-func interQueryDelay(usedWhois bool, whoisSecs int, dnsInterval time.Duration) time.Duration {
-	if !usedWhois {
-		return dnsInterval
-	}
-	if whoisSecs <= 0 {
+// whoisMakeupWait returns the residual wait before the next WHOIS query,
+// given when the previous WHOIS query completed. It returns 0 when:
+//   - there was no prior WHOIS query this session (lastDone is zero — the
+//     first query, or a fresh resume), so the first WHOIS goes out at once;
+//   - the configured delay is zero (rate limiting disabled), preserving the
+//     original tool's "fire as fast as possible" behavior;
+//   - enough time has already elapsed since the last WHOIS completion that
+//     the (jittered) target gap is already satisfied — this is the overlap
+//     win: DNS pre-checks and DNS-only verdicts that ran in between count
+//     against the cooldown, so we only sleep the remainder.
+//
+// The target gap is jittered per query with the same ±25% scheme as
+// jitteredDelay, drawn from [0.75*base, 1.25*base].
+func whoisMakeupWait(lastDone time.Time, base time.Duration) time.Duration {
+	if base <= 0 || lastDone.IsZero() {
 		return 0
 	}
-	return jitteredDelay(time.Duration(whoisSecs) * time.Second)
+	target := jitteredDelay(base)
+	if elapsed := time.Since(lastDone); elapsed < target {
+		return target - elapsed
+	}
+	return 0
 }
 
 // jitteredDelay randomizes the inter-query wait around the configured base:

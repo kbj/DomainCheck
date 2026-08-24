@@ -750,35 +750,119 @@ func TestResultAndStateDirsAutoCreated(t *testing.T) {
 	}
 }
 
-func TestInterQueryDelay(t *testing.T) {
-	// Pure-DNS verdicts: exactly the configured interval, never jittered.
-	for _, iv := range []time.Duration{100 * time.Millisecond, time.Second, 3 * time.Second} {
-		for i := 0; i < 20; i++ {
-			if d := interQueryDelay(false, 10, iv); d != iv {
-				t.Fatalf("dns path must equal -dns-interval verbatim: want %v got %v", iv, d)
-			}
+func TestWhoisMakeupWait(t *testing.T) {
+	// No prior WHOIS this session (first query / fresh resume): never wait,
+	// regardless of base. Preserves the original "first query goes at once"
+	// behavior and the resume-safe property (no carryover across sessions).
+	for _, base := range []time.Duration{time.Second, 10 * time.Second} {
+		if d := whoisMakeupWait(time.Time{}, base); d != 0 {
+			t.Fatalf("zero lastDone base=%v: want 0, got %v", base, d)
 		}
 	}
-	// Whois path with delay=0: no wait (original tool behavior preserved).
-	if d := interQueryDelay(true, 0, time.Second); d != 0 {
-		t.Fatalf("whois path delay=0 should be 0, got %v", d)
+	// delay disabled (base=0): never wait, even immediately after a WHOIS
+	// query. This is the "fire as fast as possible" original behavior.
+	if d := whoisMakeupWait(time.Now(), 0); d != 0 {
+		t.Fatalf("base=0 should not wait, got %v", d)
 	}
-	// Whois path with configured delay: jittered around it; dns interval
-	// value must not leak into the whois path.
+
+	// Right after a WHOIS completion: the full jittered target is slept.
+	// base=4s → target ∈ [3s, 5s].
+	base := 4 * time.Second
 	low, high := 3*time.Second, 5*time.Second
 	sawVariation := false
-	var last time.Duration
+	var prev time.Duration
 	for i := 0; i < 200; i++ {
-		d := interQueryDelay(true, 4, time.Second)
+		d := whoisMakeupWait(time.Now(), base)
 		if d < low || d > high {
-			t.Fatalf("whois delay %v outside [%v,%v]", d, low, high)
+			t.Fatalf("fresh lastDone base=%v: delay %v outside [%v,%v]", base, d, low, high)
 		}
-		if last != 0 && d != last {
+		if prev != 0 && d != prev {
 			sawVariation = true
 		}
-		last = d
+		prev = d
 	}
 	if !sawVariation {
-		t.Fatal("whois delay should vary (jitter)")
+		t.Fatal("makeup wait should vary (jitter)")
+	}
+
+	// Enough time already elapsed → 0. This is the overlap win: a DNS
+	// pre-check + DNS-only verdict that ran since the last WHOIS counted
+	// against the cooldown and fully consumed it.
+	if d := whoisMakeupWait(time.Now().Add(-10*time.Second), base); d != 0 {
+		t.Fatalf("elapsed > target should yield 0, got %v", d)
+	}
+
+	// Partial overlap: some cooldown already consumed; only the residual
+	// is slept. 1.5s elapsed, target ∈ [3s, 5s] → residual ∈ [1.5s, 3.5s].
+	lastDone := time.Now().Add(-1500 * time.Millisecond)
+	d := whoisMakeupWait(lastDone, base)
+	if d < 1500*time.Millisecond || d > 3500*time.Millisecond {
+		t.Fatalf("partial-overlap residual %v outside [1.5s,3.5s]", d)
+	}
+}
+
+// TestWhoisPacingOverlapsDNSVerdicts verifies the core optimization: a
+// DNS-only verdict sitting between two WHOIS queries overlaps the WHOIS
+// cooldown rather than stacking on top of it.
+//
+// Setup: abc/cde need WHOIS (no NS), bcd has NS → DNS verdict in between.
+// With -delay=1s (jitter [0.75s,1.25s]) and -dns-interval=800ms:
+//   - stacked (old) WHOIS-to-WHOIS gap ≈ jittered(1s) + 800ms ∈ [1.55s, 2.05s];
+//   - overlapped (new) gap ≈ max(jittered(1s), 800ms) ∈ [0.75s, 1.25s].
+// Asserting gap ≤ 1.4s cleanly rejects the stacked behavior while leaving
+// generous slack for CI timing noise.
+func TestWhoisPacingOverlapsDNSVerdicts(t *testing.T) {
+	dir := setupDataDir(t)
+
+	var mu sync.Mutex
+	whoisAt := map[string]time.Time{}
+	opts, fw, _ := newTestOptionsWithDNS(t, dir,
+		func(d string) string {
+			mu.Lock()
+			whoisAt[d] = time.Now()
+			mu.Unlock()
+			return d + ": object does not exist\n" // → available
+		},
+		func(d string) dnstest.Response {
+			if d == "bcd.xyz" {
+				return dnstest.Response{NSNames: []string{"ns1." + d}} // registered → DNS verdict
+			}
+			return dnstest.Response{RCode: 3} // no NS → needs WHOIS
+		})
+	opts.DelaySecs = 1                       // WHOIS gap, jitter [0.75s, 1.25s]
+	opts.DNS.BaseDelay = 800 * time.Millisecond // DNS-verdict pacing
+
+	start := time.Now()
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if n := fw.hitCount("abc.xyz"); n != 1 {
+		t.Fatalf("abc whois hits=%d", n)
+	}
+	if n := fw.hitCount("bcd.xyz"); n != 0 {
+		t.Fatalf("bcd (NS hit) must skip whois, hits=%d", n)
+	}
+	if n := fw.hitCount("cde.xyz"); n != 1 {
+		t.Fatalf("cde whois hits=%d", n)
+	}
+
+	mu.Lock()
+	gap := whoisAt["cde.xyz"].Sub(whoisAt["abc.xyz"])
+	mu.Unlock()
+
+	// Rate limit respected: the gap never drops below the jitter floor.
+	if gap < 700*time.Millisecond {
+		t.Fatalf("WHOIS-to-WHOIS gap %v below rate-limit floor (~0.75s)", gap)
+	}
+	// Overlap happened: bcd's 800ms DNS-verdict pacing did NOT stack on
+	// top of the WHOIS delay. A stacked gap would be ≥ 1.55s.
+	if gap > 1400*time.Millisecond {
+		t.Fatalf("WHOIS-to-WHOIS gap %v looks stacked (DNS verdict did not overlap)", gap)
+	}
+	// Whole scan is roughly one WHOIS gap plus tiny DNS work.
+	if elapsed > 2*time.Second {
+		t.Fatalf("run took too long: %v", elapsed)
 	}
 }

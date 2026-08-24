@@ -121,7 +121,7 @@ func testOptions(t *testing.T, dir string, behave func(string) string) (Options,
 		DictName:  "test",
 		DelaySecs: 0,
 		DNS: dns.Options{
-			Server:     dnsSrv.Addr(),
+			Servers:    []string{dnsSrv.Addr()},
 			Timeout:    300 * time.Millisecond,
 			MaxRetries: 2,
 			BaseDelay:  5 * time.Millisecond,
@@ -154,7 +154,7 @@ func newTestOptionsWithDNS(t *testing.T, dir string, behave func(string) string,
 		DictName:  "test",
 		DelaySecs: 0,
 		DNS: dns.Options{
-			Server:     dnsSrv.Addr(),
+			Servers:    []string{dnsSrv.Addr()},
 			Timeout:    300 * time.Millisecond,
 			MaxRetries: 2,
 			BaseDelay:  5 * time.Millisecond,
@@ -279,7 +279,7 @@ func TestErrorDoesNotAbortRunAndStateIsRemembered(t *testing.T) {
 	_ = fw
 }
 func statePath0(opts Options) string {
-	matches, _ := filepath.Glob(opts.DataDir + "/result/*.state.json")
+	matches, _ := filepath.Glob(opts.DataDir + "/state/*.state.json")
 	if len(matches) == 0 {
 		return "<none>"
 	}
@@ -359,6 +359,76 @@ func TestResumeKeepsDegradationAndRetriesUnfinished(t *testing.T) {
 	if !strings.Contains(out, "Resuming xyz_test") || !strings.Contains(out, "[dns") ||
 		!strings.Contains(out, "Task Done: 3 domains") {
 		t.Fatalf("resume banner/dns tags/summary missing:\n%s", out)
+	}
+}
+
+// TestForceWhoisUnDegradedOnResume mirrors the degradation test, but the
+// resume run sets ForceWhois so the task re-enables WHOIS and re-queries the
+// previously-failed domain against the (now healthy) WHOIS server.
+func TestForceWhoisUnDegradedOnResume(t *testing.T) {
+	dir := setupDataDir(t)
+
+	var whoisFailMode, dnsFailMode atomic.Bool
+	whoisFailMode.Store(true)
+	dnsFailMode.Store(true)
+	opts, fw, _ := newTestOptionsWithDNS(t, dir,
+		func(d string) string {
+			if whoisFailMode.Load() && d == "bcd.xyz" {
+				return "" // whois rejects bcd -> degrade + bcd failed
+			}
+			return d + ": no match\n"
+		},
+		func(d string) dnstest.Response {
+			if dnsFailMode.Load() && strings.Contains(d, "bcd") {
+				return dnstest.Response{RCode: 2} // SERVFAIL: dns can't help
+			}
+			return dnstest.Response{RCode: 3}
+		})
+
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	statePath := soleStatePath(t, dir)
+	tk, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tk.WhoisDisabled {
+		t.Fatalf("task should be degraded after first run")
+	}
+	defer tk.CloseJournal()
+
+	// Now everything is healthy. Resume WITH -force-whois: WHOIS gets
+	// re-enabled, bcd is queried over WHOIS again, task finishes.
+	whoisFailMode.Store(false)
+	dnsFailMode.Store(false)
+	resumeOpts := opts
+	resumeOpts.Stdout = &bytes.Buffer{}
+	resumeOpts.Resume = statePath
+	resumeOpts.ForceWhois = true
+
+	before := fw.hitCount("bcd.xyz")
+	if err := Run(context.Background(), resumeOpts); err != nil {
+		t.Fatalf("force-whois resume run: %v", err)
+	}
+	after := fw.hitCount("bcd.xyz")
+	if after <= before {
+		t.Fatalf("force-whois must re-query bcd over WHOIS: hits %d -> %d", before, after)
+	}
+	if got := fw.hitCount("abc.xyz"); got != 1 {
+		t.Fatalf("settled domains must still be skipped on resume, abc hits=%d", got)
+	}
+
+	out := resumeOpts.Stdout.(*bytes.Buffer).String()
+	if !strings.Contains(out, "-force-whois re-enabling WHOIS") {
+		t.Fatalf("missing force-whois notice:\n%s", out)
+	}
+	leftover, _ := filepath.Glob(filepath.Join(dir, "state", "*"))
+	if len(leftover) != 0 {
+		t.Fatalf("fully resumed task must delete its checkpoints, left: %v", leftover)
+	}
+	if strings.Contains(out, "uncertain") && !strings.Contains(out, "Task Done") {
+		t.Fatalf("task should finish cleanly with whois re-enabled:\n%s", out)
 	}
 }
 

@@ -19,8 +19,10 @@
 //
 // The resume cursor is therefore min(Failed[0].Index, Progress).
 //
-// Memory usage is O(1) w.r.t. dictionary size (plus the O(#failures) list);
-// only the caller's own prefix slice scales with the dictionary.
+// Memory usage of the persisted state is O(1) w.r.t. dictionary size (plus
+// the O(#failures) list); only the caller's own prefix slice scales with the
+// dictionary. Counts() is the one exception: it streams the journal and uses
+// one byte of memory per dictionary entry.
 package state
 
 import (
@@ -503,9 +505,10 @@ func loadV2(path string, data []byte) (*Task, error) {
 	if t.journalPath == "" {
 		t.journalPath = base + ".journal"
 	}
-	if err := t.openJournal(true); err != nil {
-		return nil, err
-	}
+	// Journal is opened lazily on first write (see writeJournal) so tasks
+	// loaded only for inspection — Resumable / the resume menu — never hold
+	// a file handle. BeginSession and Counts read the journal file directly
+	// (os.Open) and journalFlush is nil-safe against a closed journal.
 	return &t, nil
 }
 

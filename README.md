@@ -42,12 +42,13 @@ DomainCheck/
    **不完全可靠**（已注册但未设置解析的域名看起来与可注册域名相同）；交互模式下需确认；
 5. DNS 查询与 WHOIS 一样遵循 `-delay` 抖动延迟规则，自身失败也有指数退避重试。
 
-可用 `-dns 1.1.1.1:53` 指定自定义解析器（默认走系统配置）。
+可用 `-dns` 指定自定义解析器（默认走系统配置），支持多服务器轮询与
+DoT / DoH 加密传输，详见[「DNS 解析器配置」](#dns-解析器配置)。
 
 相比原 Python 版本，Go 版本重点增强了稳健性：
 
 - **状态记忆 / 断点续扫**：每查询完一个域名，任务状态都会原子性地写入
-  `result/*.state.json`。无论是崩溃、断网还是 Ctrl+C 中断，进度都不会丢失，
+  `state/*.state.json`。无论是崩溃、断网还是 Ctrl+C 中断，进度都不会丢失，
   可以随时从断点继续。
 - **报错自动重试 + 指数退避**：单次 WHOIS 查询失败（超时、连接失败等）会自动重试，
   重试间隔按 `基础间隔 × 2ⁿ` 指数增长并带随机抖动、设上限；重试次数用尽后该域名被
@@ -103,7 +104,7 @@ bai.xyz is NOT available #不可注册的域名
 | --- | --- |
 | `-tld` | 要扫描的域名后缀（需在 `tld.json` 中登记） |
 | `-dict` | `dict/` 目录下的字典文件名 |
-| `-delay` | **WHOIS 查询**间隔（秒），默认 0；实际等待在设定值附近随机抖动 ±25%。纯 DNS 判定的域名之间固定间隔 0.5s，不受此参数影响 |
+| `-delay` | **WHOIS 查询**间隔（秒），默认 0；实际等待在设定值附近随机抖动 ±25%。纯 DNS 判定的域名之间固定间隔由 `-dns-interval` 控制（默认 1s），不受此参数影响 |
 | `-resume` | 续扫：`latest` 为最近一个未完成任务，或指定 `.state.json` 路径 |
 | `-data` | 数据目录（含 `tld.json`、`dict/`、`result/`），默认当前目录 |
 | `-timeout` | 单次查询超时（WHOIS 与 DNS 共用，默认 10s） |
@@ -112,7 +113,8 @@ bai.xyz is NOT available #不可注册的域名
 | `-dns-retries` | DNS 查询失败后的重试次数（默认 1，即最多尝试 2 次） |
 | `-dns-interval` | 纯 DNS 判定域名之间的固定间隔，同时作为 DNS 重试退避基数（默认 1s，最小可设 0.1s） |
 | `-max-backoff` | 两类重试等待的上限（默认 60s） |
-| `-dns` | 自定义 DNS 解析器（host:port），用于 NS 预检 |
+| `-force-whois` | 续扫时重新启用 WHOIS：针对曾因反爬耗尽重试而降级为 DNS-only 的任务，清降级标记后重新走 WHOIS（仅当该后缀在 `tld.json` 中有 WHOIS 配置时生效） |
+| `-dns` | 自定义 DNS 解析器（NS 预检用），逗号分隔多个；条目格式见下文「DNS 解析器配置」 |
 | `-gen` / `-charset` / `-len` / `-out` | 字典生成模式及参数 |
 | `-list-tlds` / `-list-dicts` | 列出可用的后缀 / 字典 |
 
@@ -121,7 +123,7 @@ bai.xyz is NOT available #不可注册的域名
 ```
 ./domaincheck -resume latest
 # 或
-./domaincheck -resume result/su_allpy_2026-08-21-14-29-09.state.json
+./domaincheck -resume state/su_allpy_2026-08-21-14-29-09.state.json
 ```
 
 ## 文件说明
@@ -137,6 +139,37 @@ bai.xyz is NOT available #不可注册的域名
 `dict`为字典：
 - allpy 所有单拼
 - test 测试
+
+## DNS 解析器配置
+
+`-dns` 接受逗号分隔的多个解析器，扫描请求按**轮询**方式依次分发到各台；
+某次查询失败重试时自动切换到列表中的下一台（内置故障转移）。不指定时使用系统解析器。
+
+每个条目支持以下写法（端口可省略，采用默认值）：
+
+| 写法 | 协议 | 默认端口 |
+| --- | --- | --- |
+| `1.1.1.1` 或 `udp://1.1.1.1:53` | 普通 UDP DNS | 53 |
+| `tcp://1.1.1.1:53` | TCP DNS | 53 |
+| `tls://1.1.1.1:853` | DoT（DNS over TLS） | 853 |
+| `https://cloudflare-dns.com/dns-query` | DoH（DNS over HTTPS） | — |
+
+示例：
+
+```
+# 单台：普通 UDP
+./domaincheck -tld xyz -dict allpy -dns 1.1.1.1:53
+
+# 多台混合协议，轮询分发，失败自动切换下一台
+./domaincheck -tld xyz -dict allpy \
+    -dns "1.1.1.1,tls://8.8.8.8,https://doh.pub/dns-query"
+```
+
+说明：
+
+- IPv6 地址需写成 `[2001:db8::1]:53` 形式；
+- DoT/DoH 使用标准 TLS 证书校验，公网服务商开箱即用；
+- 启动时会立即校验所有条目，写错协议或地址会直接报错退出，不会污染扫描结果。
 
 `result`输出目录：
 - `<tld>_<dict>_<时间>.log`：结果日志，格式与原版完全一致（仅记录可注册域名）

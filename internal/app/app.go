@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,11 @@ type Options struct {
 	// confirms an unconfigured TLD.
 	ForceDNSOnly bool
 
+	// ForceWhois un-degrades a previously degraded task on resume: if the
+	// task has a NIC configured, WhoisDisabled is cleared so WHOIS is retried.
+	// Has no effect on a fresh (non-resumed) task.
+	ForceWhois bool
+
 	// Dictionary generator (-gen): write every WordLen-length combination
 	// of Charset into <DataDir>/dict/<OutName> and exit.
 	Gen     bool
@@ -86,8 +92,8 @@ func Run(ctx context.Context, opts Options) error {
 	printf := func(format string, args ...any) { fmt.Fprintf(opts.Stdout, format+"\n", args...) }
 	eprintf := func(format string, args ...any) { fmt.Fprintf(opts.Stderr, format+"\n", args...) }
 
-	resultDir := opts.DataDir + "/result" // kept relative like the Python tool
-	stateDir := opts.DataDir + "/state"   // resume checkpoints live apart from results
+	resultDir := filepath.Join(opts.DataDir, "result") // kept relative like the Python tool
+	stateDir := filepath.Join(opts.DataDir, "state")   // resume checkpoints live apart from results
 	if err := os.MkdirAll(resultDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", resultDir, err)
 	}
@@ -125,12 +131,26 @@ func Run(ctx context.Context, opts Options) error {
 	// When resuming, refresh the WHOIS configuration from the current
 	// tld.json: servers/marker strings may have been corrected since the
 	// task started. Dictionary choice and existing progress are untouched.
-	if opts.Resume != "" && !task.WhoisDisabled && task.NIC != "" {
-		if entry, lerr := registry.Lookup(task.TLD); lerr == nil &&
-			(entry.NIC != task.NIC || entry.Response != task.ResponseMark) {
-			printf("note: refreshed WHOIS config from tld.json (server %s -> %s)", task.NIC, entry.NIC)
-			task.NIC = entry.NIC
-			task.ResponseMark = entry.Response
+	//
+	// -force-whois additionally un-degrades a task that had fallen back to
+	// DNS-only mode (the TLD must still have a working WHOIS config).
+	if opts.Resume != "" && task.NIC != "" {
+		dirty := false
+		if opts.ForceWhois && task.WhoisDisabled {
+			printf("note: -force-whois re-enabling WHOIS for this task (was degraded to DNS-only)")
+			task.WhoisDisabled = false
+			dirty = true
+		}
+		if !task.WhoisDisabled {
+			if entry, lerr := registry.Lookup(task.TLD); lerr == nil &&
+				(entry.NIC != task.NIC || entry.Response != task.ResponseMark) {
+				printf("note: refreshed WHOIS config from tld.json (server %s -> %s)", task.NIC, entry.NIC)
+				task.NIC = entry.NIC
+				task.ResponseMark = entry.Response
+				dirty = true
+			}
+		}
+		if dirty {
 			if serr := task.SaveMeta(); serr != nil {
 				eprintf("WARN could not save refreshed state: %v", serr)
 			}
@@ -194,7 +214,7 @@ func startNewTask(ctx context.Context, opts Options, registry *config.Registry, 
 	}
 	start := time.Now()
 	logPath := state.LogPath(resultDir, strings.ToLower(opts.TLD), opts.DictName, start)
-	sp := state.StatePath(opts.DataDir+"/state", strings.ToLower(opts.TLD), opts.DictName, start)
+	sp := state.StatePath(filepath.Join(opts.DataDir, "state"), strings.ToLower(opts.TLD), opts.DictName, start)
 	task, err := state.New(state.Config{
 		TLD:          strings.ToLower(opts.TLD),
 		DictName:     opts.DictName,
@@ -227,7 +247,7 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 	in := bufio.NewScanner(opts.Stdin)
 
 	// Resume menu: offer unfinished tasks first, if any.
-	paths, tasks, err := state.Resumable(opts.DataDir + "/state")
+	paths, tasks, err := state.Resumable(filepath.Join(opts.DataDir, "state"))
 	if err != nil {
 		eprintf("note: could not scan %s for resumable tasks: %v", resultDir, err)
 	}
@@ -315,7 +335,7 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 		p := dict.Path(opts.DataDir, s)
 		if _, err := os.Stat(p); err != nil {
 			return "", fmt.Errorf("dict not found in %s; available: %s",
-				filepathJoin(opts.DataDir, "dict"), strings.Join(dict.List(opts.DataDir), ", "))
+				filepath.Join(opts.DataDir, "dict"), strings.Join(dict.List(opts.DataDir), ", "))
 		}
 		return s, nil
 	})
@@ -338,8 +358,6 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 	newOpts.ForceDNSOnly = tldDNSOnly
 	return startNewTask(ctx, newOpts, registry, resultDir, printf, eprintf)
 }
-
-func filepathJoin(parts ...string) string { return strings.Join(parts, "/") }
 
 // runLoop performs the actual scanning with full state persistence.
 // The dictionary is (re)loaded from task.DictPath so a resumed session
@@ -370,7 +388,10 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	client := whois.NewClient(warnOpts)
 	dnsOpts := opts.DNS
 	dnsOpts.Logf = func(format string, args ...any) { eprintf("WARN dns "+format, args...) }
-	nsChecker := dns.New(dnsOpts)
+	nsChecker, err := dns.New(dnsOpts)
+	if err != nil {
+		return fmt.Errorf("invalid DNS resolver configuration: %w", err)
+	}
 
 	if task.NIC == "" {
 		task.WhoisDisabled = true // task created without a WHOIS configuration
@@ -636,12 +657,12 @@ func pickResumable(opts Options, printf func(string, ...any)) (*state.Task, erro
 	sel := strings.TrimSpace(opts.Resume)
 	switch strings.ToLower(sel) { // keywords are case-insensitive; paths must keep their case
 	case "", "latest", "true", "yes", "y":
-		_, tasks, err := state.Resumable(opts.DataDir + "/state")
+		_, tasks, err := state.Resumable(filepath.Join(opts.DataDir, "state"))
 		if err != nil {
 			return nil, err
 		}
 		if len(tasks) == 0 {
-			return nil, fmt.Errorf("no unfinished tasks found in %s", opts.DataDir+"/state")
+			return nil, fmt.Errorf("no unfinished tasks found in %s", filepath.Join(opts.DataDir, "state"))
 		}
 		t := tasks[0]
 		printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.Cursor(), t.Total)

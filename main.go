@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"time"
@@ -27,14 +28,13 @@ import (
 
 func main() {
 	var (
-		opts app.Options
-
+		opts        app.Options
 		dataDir     = flag.String("data", ".", "data directory containing tld.json, dict/ and result/")
 		tld         = flag.String("tld", "", "TLD to scan (skips interactive prompt)")
 		dictName    = flag.String("dict", "", "dictionary name inside dict/ (skips interactive prompt)")
 		delay       = flag.Int("delay", 0, "delay between queries in seconds")
 		resume      = flag.String("resume", "", "resume an unfinished task: 'latest' or a path to a *.state.json file")
-		dnsServer   = flag.String("dns", "", "custom DNS resolver for NS pre-checks, host:port (default: system resolver)")
+		dnsServer   = flag.String("dns", "", `custom DNS resolvers for NS pre-checks, comma-separated; entries: "host[:port]"/"udp://" plain DNS (port 53), "tcp://" (port 53), "tls://" DoT (port 853), "https://..." DoH; e.g. "1.1.1.1,tls://8.8.8.8" (default: system resolver)`)
 		genDict     = flag.Bool("gen", false, "generate a dictionary from -charset/-len and exit")
 		charset     = flag.String("charset", "", "dictionary generator: candidate characters, e.g. \"abc123\"")
 		wordLen     = flag.Int("len", 0, "dictionary generator: length of every entry")
@@ -47,6 +47,7 @@ func main() {
 		dnsRetries  = flag.Int("dns-retries", 1, "DNS lookup retries after the first attempt")
 		dnsInterval = flag.Duration("dns-interval", time.Second, "pause between pure-DNS verdicts / DNS retry backoff base (min 100ms)")
 		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for both retry backoffs")
+		forceWhois  = flag.Bool("force-whois", false, "on resume, re-enable WHOIS for a task that had degraded to DNS-only mode")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
@@ -76,6 +77,7 @@ func main() {
 	opts.Charset = *charset
 	opts.WordLen = *wordLen
 	opts.OutName = *outName
+	opts.ForceWhois = *forceWhois
 	if *dnsInterval < 100*time.Millisecond {
 		fmt.Fprintln(os.Stderr, "Error: -dns-interval must be at least 100ms")
 		os.Exit(2)
@@ -87,7 +89,7 @@ func main() {
 		MaxDelay:   *maxBackoff,
 	}
 	opts.DNS = dns.Options{
-		Server:     *dnsServer,
+		Servers:    splitList(*dnsServer),
 		Timeout:    *timeout,
 		MaxRetries: *dnsRetries,
 		BaseDelay:  *dnsInterval,
@@ -118,4 +120,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// splitList breaks a comma-separated flag value into trimmed, non-empty
+// entries. Empty input yields nil so the zero value keeps its default meaning.
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

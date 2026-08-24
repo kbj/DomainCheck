@@ -264,6 +264,78 @@ func TestSaveLoadRoundtripV2(t *testing.T) {
 	}
 }
 
+// TestLoadDoesNotOpenJournal verifies the FD-leak fix: Load must NOT eagerly
+// open the journal. Tasks loaded only for inspection (Resumable, the
+// interactive resume menu) would otherwise leak a file handle each.
+func TestLoadDoesNotOpenJournal(t *testing.T) {
+	tk := newTestTask(t)
+	if err := tk.Record(0, "abc.xyz", StatusAvailable, "", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.SaveMeta(); err != nil {
+		t.Fatal(err)
+	}
+	tk.CloseJournal()
+
+	got, err := Load(tk.metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.CloseJournal()
+	if got.journalF != nil || got.journal != nil {
+		t.Fatalf("Load must not open the journal eagerly (lazy on first write): journalF=%v journal=%v", got.journalF, got.journal)
+	}
+	// Reads must still work without an open journal handle.
+	if _, err := got.Counts(); err != nil {
+		t.Fatalf("Counts without open journal: %v", err)
+	}
+	if _, err := got.BeginSession(); err != nil {
+		t.Fatalf("BeginSession without open journal: %v", err)
+	}
+	// The first write must lazily open the journal.
+	if err := got.Record(1, "bcd.xyz", StatusUnavailable, "", 1); err != nil {
+		t.Fatalf("first write after lazy Load: %v", err)
+	}
+	if got.journalF == nil || got.journal == nil {
+		t.Fatalf("first write must lazily open the journal")
+	}
+}
+
+// TestResumableDoesNotLeakJournalHandles ensures Resumable returns tasks
+// whose journals are not open, so dropping the non-selected ones leaks
+// nothing.
+func TestResumableDoesNotLeakJournalHandles(t *testing.T) {
+	dir := t.TempDir()
+	open, err := New(Config{TLD: "a", DictName: "d",
+		StatePath:   filepath.Join(dir, "open.state.json"),
+		JournalPath: filepath.Join(dir, "open.journal"),
+		Total:       2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := open.Record(0, "a0", StatusAvailable, "", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := open.SaveMeta(); err != nil {
+		t.Fatal(err)
+	}
+	open.CloseJournal()
+
+	_, tasks, err := Resumable(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 resumable task, got %d", len(tasks))
+	}
+	for i, tk := range tasks {
+		if tk.journalF != nil || tk.journal != nil {
+			t.Fatalf("task %d journal must be closed after Resumable: journalF=%v", i, tk.journalF)
+		}
+		tk.CloseJournal() // be tidy
+	}
+}
+
 func TestLoadRejectsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "bad.state.json")

@@ -34,5 +34,17 @@
   "lu": {
     "nic": "whois.dns.lu",
     "response": "no such domain"
+  },
+  "cc": {
+    "nic": "ccwhois.verisign-grs.com",
+    "response": "no match for"
+  },
+  "org": {
+    "nic": "whois.publicinterestregistry.org",
+    "response": "domain not found"
+  },
+  "im": {
+    "nic": "whois.nic.im",
+    "response": "was not found"
   }
 }

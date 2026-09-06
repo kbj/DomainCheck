@@ -205,9 +205,12 @@ func startNewTask(ctx context.Context, opts Options, registry *config.Registry, 
 		nic, mark = entry.NIC, entry.Response
 	}
 	dictPath := dict.Path(opts.DataDir, opts.DictName)
-	prefixes, err := dict.Load(dictPath)
+	total, err := dict.Open(dictPath).Count()
 	if err != nil {
 		return nil, err
+	}
+	if total == 0 {
+		return nil, fmt.Errorf("%s: dictionary is empty", dictPath)
 	}
 	if opts.DelaySecs < 0 {
 		return nil, fmt.Errorf("delay must be >= 0")
@@ -225,7 +228,7 @@ func startNewTask(ctx context.Context, opts Options, registry *config.Registry, 
 		LogPath:      logPath,
 		StatePath:    sp,
 		JournalPath:  state.JournalPath(sp),
-		Total:        len(prefixes),
+		Total:        total,
 	})
 	if err != nil {
 		return nil, err
@@ -360,8 +363,10 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 }
 
 // runLoop performs the actual scanning with full state persistence.
-// The dictionary is (re)loaded from task.DictPath so a resumed session
-// always reflects the current file; its size must match the recorded total.
+// The dictionary is streamed from task.DictPath so a resumed session
+// always reflects the current file; its entry count must match the
+// recorded total. Streaming keeps memory O(1) in dictionary size, which
+// is what makes multi-million-entry generated dictionaries viable.
 //
 // Per-domain flow:
 //  1. DNS NS pre-check — NS records prove registration, skipping WHOIS.
@@ -372,13 +377,15 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 func runLoop(ctx context.Context, opts Options, task *state.Task,
 	printf, eprintf func(string, ...any)) error {
 
-	prefixes, err := dict.Load(task.DictPath)
+	prefixes := dict.Open(task.DictPath)
+	defer prefixes.Close()
+	total, err := prefixes.Count()
 	if err != nil {
 		return err
 	}
-	if len(prefixes) != task.Total {
+	if total != task.Total {
 		return fmt.Errorf("dictionary %s changed since the task started: %d entries now, %d recorded",
-			task.DictPath, len(prefixes), task.Total)
+			task.DictPath, total, task.Total)
 	}
 	defer task.CloseJournal()
 
@@ -565,7 +572,14 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			break
 		}
 
-		domain := prefixes[i] + "." + task.TLD
+		domain, derr := prefixes.At(i)
+		if derr != nil {
+			// The dictionary shrank below its recorded total mid-run: the
+			// on-disk state (which points past this index) stays valid, and
+			// the count check above already reports the mismatch on resume.
+			return fmt.Errorf("read dictionary entry %d: %w", i, derr)
+		}
+		domain += "." + task.TLD
 		ok, usedWhois := checkDomain(i, domain)
 		if !ok {
 			interrupted = true

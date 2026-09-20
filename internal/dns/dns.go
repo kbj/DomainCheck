@@ -21,6 +21,9 @@ const (
 	DefaultMaxRetries = 1 // extra attempts after the first one
 	DefaultBaseDelay  = 1 * time.Second
 	DefaultMaxDelay   = 5 * time.Second
+	// DefaultConcurrency is the number of parallel NS pre-checks. It only
+	// multiplies the DNS-side throughput; WHOIS pacing is untouched.
+	DefaultConcurrency = 5
 )
 
 // Options configures the checker. Zero values fall back to the defaults.
@@ -37,6 +40,11 @@ type Options struct {
 	// "tls://", "https://" or bare host[:port]). Queries are distributed
 	// round-robin across all entries. Empty means use the system resolver.
 	Servers []string
+	// Concurrency is how many lookups may run in parallel (the two-queue
+	// scan uses it as the DNS worker-pool size). Round-robin distribution
+	// spreads the workers across all configured resolvers. 0 falls back
+	// to DefaultConcurrency; 1 restores fully serial behavior.
+	Concurrency int
 	// Logf receives human-readable retry notices; may be nil.
 	Logf func(format string, args ...any)
 

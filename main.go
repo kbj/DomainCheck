@@ -32,7 +32,7 @@ func main() {
 		dataDir     = flag.String("data", ".", "data directory containing tld.json, dict/ and result/")
 		tld         = flag.String("tld", "", "TLD to scan (skips interactive prompt)")
 		dictName    = flag.String("dict", "", "dictionary name inside dict/ (skips interactive prompt)")
-		delay       = flag.Int("delay", 0, "delay between queries in seconds")
+		delay       = flag.Int("delay", 0, "delay between WHOIS queries in seconds")
 		resume      = flag.String("resume", "", "resume an unfinished task: 'latest' or a path to a *.state.json file")
 		dnsServer   = flag.String("dns", "", `custom DNS resolvers for NS pre-checks, comma-separated; entries: "host[:port]"/"udp://" plain DNS (port 53), "tcp://" (port 53), "tls://" DoT (port 853), "https://..." DoH; e.g. "1.1.1.1,tls://8.8.8.8" (default: system resolver)`)
 		genDict     = flag.Bool("gen", false, "generate a dictionary from -charset/-len and exit")
@@ -45,7 +45,9 @@ func main() {
 		retries     = flag.Int("retries", 3, "WHOIS retries per query after the first attempt")
 		interval    = flag.Duration("interval", 10*time.Second, "WHOIS retry interval (exponential backoff base)")
 		dnsRetries  = flag.Int("dns-retries", 1, "DNS lookup retries after the first attempt")
-		dnsInterval = flag.Duration("dns-interval", time.Second, "pause between pure-DNS verdicts / DNS retry backoff base (min 100ms)")
+		dnsInterval = flag.Duration("dns-interval", time.Second, "per-worker pause between DNS pre-checks / DNS retry backoff base (min 100ms)")
+		dnsWorkers  = flag.Int("dns-concurrency", dns.DefaultConcurrency, "parallel DNS NS pre-checks (two-queue pipeline; WHOIS pacing untouched; 1 = serial)")
+		whoisQueue  = flag.Int("whois-queue", app.DefaultWhoisQueue, "max domains waiting for the serial WHOIS consumer (backpressure valve)")
 		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for both retry backoffs")
 		forceWhois  = flag.Bool("force-whois", false, "on resume, re-enable WHOIS for a task that had degraded to DNS-only mode")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -89,12 +91,14 @@ func main() {
 		MaxDelay:   *maxBackoff,
 	}
 	opts.DNS = dns.Options{
-		Servers:    splitList(*dnsServer),
-		Timeout:    *timeout,
-		MaxRetries: *dnsRetries,
-		BaseDelay:  *dnsInterval,
-		MaxDelay:   *maxBackoff,
+		Servers:     splitList(*dnsServer),
+		Timeout:     *timeout,
+		MaxRetries:  *dnsRetries,
+		BaseDelay:   *dnsInterval,
+		MaxDelay:    *maxBackoff,
+		Concurrency: *dnsWorkers,
 	}
+	opts.WhoisQueue = *whoisQueue
 
 	// Interactive when the user gave no task-defining flags, mirroring the
 	// Python behavior of just running `python3 GetDomain.py`.

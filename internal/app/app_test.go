@@ -337,6 +337,10 @@ func TestErrorDoesNotAbortRunAndStateIsRemembered(t *testing.T) {
 		},
 		func(d string) dnstest.Response { return dnstest.Response{RCode: 3} }, // no NS anywhere
 	)
+	// Degradation order matters for this assertion set: keep the DNS side
+	// serial so domains reach the WHOIS consumer in dictionary order and
+	// bcd is the first query (the deterministic degrade trigger).
+	opts.DNS.Concurrency = 1
 
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("a failing domain must NOT abort the run, got: %v", err)
@@ -545,9 +549,11 @@ func TestInterruptSavesProgressAndResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Checked < 1 {
-		t.Fatalf("first result must be persisted before interruption: %+v", c)
-	}
+	// Two-queue caveat: the DNS worker pool feeds the WHOIS queue out of
+	// dictionary order, so exactly WHICH domains settled before the
+	// cancellation took effect is racy (0..3). Only the invariants hold:
+	// bcd (whose WHOIS was in flight at cancel) never records, the task
+	// is not done, and resuming completes it.
 	if tk.Done() || tk.Cursor() >= 3 {
 		t.Fatalf("task must be incomplete after interrupt: cursor=%d counts=%+v", tk.Cursor(), c)
 	}
@@ -574,49 +580,59 @@ func TestInterruptSavesProgressAndResumes(t *testing.T) {
 }
 
 // TestExpiringLogResumeKeepsSingleHeader covers the cross-session behavior:
-// an expiring entry recorded in the first (interrupted) session must not get
+// an expiring entry recorded in the first (incomplete) session must not get
 // a second header on resume, and the Task Done footer must still be
 // appended by the resuming session.
+//
+// Deterministic instead of cancel-based: bcd always records its
+// pendingDelete verdict; cde fails WHOIS *and* DNS, so the first run ends
+// with checkpoints kept but the expiring log already written.
 func TestExpiringLogResumeKeepsSingleHeader(t *testing.T) {
 	dir := setupDataDir(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	var cdeWhoisFailMode, cdeDNSFailMode atomic.Bool
+	opts, _, _ := newTestOptionsWithDNS(t, dir,
+		func(d string) string {
+			if cdeWhoisFailMode.Load() && d == "cde.xyz" {
+				return "" // whois rejects cde outright
+			}
+			if d == "bcd.xyz" {
+				return d + "\nDomain Status: pendingDelete https://icann.org/epp#pendingDelete\n"
+			}
+			return d + "\nRegistrar: someone\n"
+		},
+		func(d string) dnstest.Response {
+			if cdeDNSFailMode.Load() && strings.Contains(d, "cde") {
+				return dnstest.Response{RCode: 2} // SERVFAIL: dns can't help
+			}
+			return dnstest.Response{RCode: 3} // no NS anywhere
+		})
+	cdeWhoisFailMode.Store(true)
+	cdeDNSFailMode.Store(true)
 
-	// bcd (index 1) gets a pendingDelete verdict and is recorded; cancel
-	// as soon as the THIRD domain arrives so the run is interrupted after
-	// the expiring log already has content.
-	opts, _ := testOptions(t, dir, func(d string) string {
-		if d == "cde.xyz" {
-			cancel() // simulate Ctrl+C right when cde is being queried
-			time.Sleep(10 * time.Millisecond)
-		}
-		if d == "bcd.xyz" {
-			return d + "\nDomain Status: pendingDelete https://icann.org/epp#pendingDelete\n"
-		}
-		return d + "\nRegistrar: someone\n"
-	})
-
-	err := Run(ctx, opts)
-	if err == nil || !strings.Contains(err.Error(), "interrupted") {
-		t.Fatalf("want ErrInterrupted, got %v", err)
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("first run: %v", err)
 	}
 
-	statePath := soleStatePath(t, dir) // progress must already be on disk
+	statePath := soleStatePath(t, dir) // cde failed -> task incomplete
 	tk, err := state.Load(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tk.CloseJournal()
 	c, err := tk.Counts()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.PendingDelete != 1 || c.Pending < 1 {
-		t.Fatalf("bcd must be pending-delete and cde unchecked: %+v", c)
+	if c.PendingDelete != 1 || c.Failed != 1 {
+		t.Fatalf("bcd must be pending-delete and cde failed: %+v", c)
 	}
+	defer tk.CloseJournal()
 
-	// Resume without cancelling: finishes cde, footer appended, single header.
+	// Resume with everything healthy: cde re-judged, task completes, the
+	// resuming session appends the Task Done footer to the expiring log
+	// that the first session created.
+	cdeWhoisFailMode.Store(false)
+	cdeDNSFailMode.Store(false)
 	resumeOpts := opts
 	resumeOpts.Resume = statePath
 	resumeOpts.Stdout = &bytes.Buffer{}
@@ -807,6 +823,77 @@ func TestInteractiveUnconfiguredTLDConfirm(t *testing.T) {
 	}
 }
 
+// TestTwoQueuePipeline verifies the parallel DNS / serial WHOIS behavior:
+// NS-hit domains settle inside the DNS pool and never reach WHOIS, while
+// NS-miss domains all get a WHOIS verdict despite the concurrency, and the
+// WHOIS server is never contacted by more than one query at a time.
+func TestTwoQueuePipeline(t *testing.T) {
+	dir := setupDataDir(t)
+
+	// 9-entry dictionary: 5 with NS (DNS verdicts), 4 without (WHOIS).
+	dictContent := "a1\na2\na3\nb1\nb2\nb3\nc1\nc2\nc3\n"
+	if err := os.WriteFile(filepath.Join(dir, "dict", "test"), []byte(dictContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var concurrent int32 // WHOIS-overlap detector: >1 means serial WHOIS broke
+	opts, fw, _ := newTestOptionsWithDNS(t, dir,
+		func(d string) string {
+			atomic.AddInt32(&concurrent, 1)
+			defer atomic.AddInt32(&concurrent, -1)
+			if atomic.LoadInt32(&concurrent) > 1 {
+				t.Errorf("WHOIS consumer went parallel: %d in flight", concurrent)
+			}
+			time.Sleep(5 * time.Millisecond) // small RTT so overlap is detectable
+			return d + ": object does not exist\n"
+		},
+		func(d string) dnstest.Response {
+			if strings.HasPrefix(d, "a") {
+				return dnstest.Response{NSNames: []string{"ns1." + d}} // registered
+			}
+			return dnstest.Response{RCode: 3} // no NS → needs WHOIS
+		})
+	opts.DNS.Concurrency = 5
+
+	start := time.Now()
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	// Every NS-hit domain got a DNS verdict without touching WHOIS.
+	for _, d := range []string{"a1.xyz", "a2.xyz", "a3.xyz"} {
+		if n := fw.hitCount(d); n != 0 {
+			t.Fatalf("%s has NS records; whois must be skipped, hits=%d", d, n)
+		}
+	}
+	// Every NS-miss domain was WHOIS-judged exactly once.
+	for _, d := range []string{"b1.xyz", "b2.xyz", "b3.xyz", "c1.xyz"} {
+		if n := fw.hitCount(d); n != 1 {
+			t.Fatalf("%s must be whois-checked exactly once, hits=%d", d, n)
+		}
+	}
+
+	out := opts.Stdout.(*bytes.Buffer).String()
+	if !strings.Contains(out, "a1.xyz is NOT available [dns]") {
+		t.Fatalf("dns verdict missing:\n%s", out)
+	}
+	if !strings.Contains(out, "b1.xyz is available") {
+		t.Fatalf("whois verdict missing:\n%s", out)
+	}
+	if !strings.Contains(out, "Task Done: 9 domains") {
+		t.Fatalf("summary mismatch:\n%s", out)
+	}
+
+	// Speed sanity: the pipeline must not serialize everything (a fully
+	// serial 9-domain run with per-domain pacing would take far longer).
+	// Keep the bound loose — CI machines are slow; this is a smoke check
+	// that the DNS pool actually overlaps work, not a benchmark.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("pipeline too slow: %v", elapsed)
+	}
+}
+
 func TestGenerateDict(t *testing.T) {
 	dir := t.TempDir() // no dict/ subdir yet: generator must create it
 	opts := Options{DataDir: dir, Gen: true, Charset: "ab1", WordLen: 3, OutName: "gen.txt"}
@@ -960,8 +1047,13 @@ func TestWhoisMakeupWait(t *testing.T) {
 // With -delay=1s (jitter [0.75s,1.25s]) and -dns-interval=800ms:
 //   - stacked (old) WHOIS-to-WHOIS gap ≈ jittered(1s) + 800ms ∈ [1.55s, 2.05s];
 //   - overlapped (new) gap ≈ max(jittered(1s), 800ms) ∈ [0.75s, 1.25s].
+//
 // Asserting gap ≤ 1.4s cleanly rejects the stacked behavior while leaving
 // generous slack for CI timing noise.
+//
+// Two-queue note: abc and cde reach the WHOIS consumer out of dictionary
+// order, so the measured gap is between the two WHOIS timestamps sorted
+// by time — the pacing invariant itself is order-independent.
 func TestWhoisPacingOverlapsDNSVerdicts(t *testing.T) {
 	dir := setupDataDir(t)
 
@@ -980,7 +1072,7 @@ func TestWhoisPacingOverlapsDNSVerdicts(t *testing.T) {
 			}
 			return dnstest.Response{RCode: 3} // no NS → needs WHOIS
 		})
-	opts.DelaySecs = 1                       // WHOIS gap, jitter [0.75s, 1.25s]
+	opts.DelaySecs = 1                          // WHOIS gap, jitter [0.75s, 1.25s]
 	opts.DNS.BaseDelay = 800 * time.Millisecond // DNS-verdict pacing
 
 	start := time.Now()
@@ -1000,8 +1092,13 @@ func TestWhoisPacingOverlapsDNSVerdicts(t *testing.T) {
 	}
 
 	mu.Lock()
-	gap := whoisAt["cde.xyz"].Sub(whoisAt["abc.xyz"])
+	times := []time.Time{whoisAt["abc.xyz"], whoisAt["cde.xyz"]}
 	mu.Unlock()
+	// Sort: queue arrival order is racy under the two-queue pipeline.
+	if times[1].Before(times[0]) {
+		times[0], times[1] = times[1], times[0]
+	}
+	gap := times[1].Sub(times[0])
 
 	// Rate limit respected: the gap never drops below the jitter floor.
 	if gap < 700*time.Millisecond {

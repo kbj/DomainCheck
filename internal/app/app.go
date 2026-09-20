@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/uselibrary/DomainCheck/internal/config"
@@ -47,8 +48,14 @@ type Options struct {
 	ListDicts bool
 
 	// DNS configures the NS pre-check lookups (resolver override, retries,
-	// backoff). Zero fields fall back to package defaults.
+	// backoff, worker concurrency). Zero fields fall back to package
+	// defaults.
 	DNS dns.Options
+	// WhoisQueue bounds the channel feeding the serial WHOIS consumer.
+	// It is the backpressure valve: when it fills up, the DNS pre-check
+	// workers block instead of ballooning memory on huge dictionaries.
+	// Zero falls back to DefaultWhoisQueue.
+	WhoisQueue int
 	// ForceDNSOnly skips WHOIS entirely; set interactively after the user
 	// confirms an unconfigured TLD.
 	ForceDNSOnly bool
@@ -74,6 +81,11 @@ type Options struct {
 
 const separator = "****************"
 
+// DefaultWhoisQueue bounds the channel between the DNS worker pool and the
+// serial WHOIS consumer. It is the backpressure valve that keeps memory
+// O(queueCap) instead of O(pending WHOIS work) on huge dictionaries.
+const DefaultWhoisQueue = 512
+
 // Run executes the tool. It returns ErrInterrupted if ctx was cancelled; in
 // every error path all progress written so far is already persisted on disk.
 func Run(ctx context.Context, opts Options) error {
@@ -91,6 +103,22 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	printf := func(format string, args ...any) { fmt.Fprintf(opts.Stdout, format+"\n", args...) }
 	eprintf := func(format string, args ...any) { fmt.Fprintf(opts.Stderr, format+"\n", args...) }
+	// printf/eprintf may be called concurrently: DNS pre-check workers
+	// print verdicts while the WHOIS consumer prints its own, and both
+	// write warnings. A single mutex keeps lines whole (one Write per
+	// line into the same bytes.Buffer/os.File) — without it, -race and
+	// interleaved terminal output corrupt lines.
+	var printMu sync.Mutex
+	printf = func(format string, args ...any) {
+		printMu.Lock()
+		defer printMu.Unlock()
+		fmt.Fprintf(opts.Stdout, format+"\n", args...)
+	}
+	eprintf = func(format string, args ...any) {
+		printMu.Lock()
+		defer printMu.Unlock()
+		fmt.Fprintf(opts.Stderr, format+"\n", args...)
+	}
 
 	resultDir := filepath.Join(opts.DataDir, "result") // kept relative like the Python tool
 	stateDir := filepath.Join(opts.DataDir, "state")   // resume checkpoints live apart from results
@@ -258,8 +286,8 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 		printf("")
 		printf("Found unfinished task(s):")
 		for i, t := range tasks {
-			line := fmt.Sprintf("  [%d] %s/%s  progress:%d/%d failed:%d",
-				i+1, t.TLD, t.DictName, t.Cursor(), t.Total, len(t.Failed))
+			line := fmt.Sprintf("  [%d] %s/%s  checked:%d/%d failed:%d",
+				i+1, t.TLD, t.DictName, t.CheckedCount(), t.Total, len(t.Failed))
 			if c, cerr := t.Counts(); cerr == nil {
 				line += fmt.Sprintf(" available:%d unavailable:%d redemption:%d pending-delete:%d pending:%d",
 					c.Available, c.Unavailable, c.Redemption, c.PendingDelete, c.Pending)
@@ -285,7 +313,7 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 				if loadErr != nil {
 					return nil, loadErr
 				}
-				printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.Cursor(), t.Total)
+				printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.CheckedCount(), t.Total)
 				return t, nil
 			}
 			printf("Please enter 1-%d, or an empty line for a new task.", len(tasks))
@@ -362,15 +390,27 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 	return startNewTask(ctx, newOpts, registry, resultDir, printf, eprintf)
 }
 
-// runLoop performs the actual scanning with full state persistence.
+// runLoop performs the actual scanning with full state persistence, using
+// a two-queue pipeline:
+//
+//	dictionary ──► DNS worker pool (N parallel NS pre-checks) ──► bounded
+//	queue ──► serial WHOIS consumer (rate-limited exactly as before)
+//
+// The DNS pool runs ahead fast (opts.DNS.Concurrency workers); the WHOIS
+// side stays strictly serial to preserve the anti-crawl pacing. The queue
+// is bounded so backpressure — not memory — absorbs the speed mismatch on
+// multi-million-entry dictionaries. Concurrency only multiplies the
+// DNS-side throughput; WHOIS behavior (makeup waits, backoff, degradation,
+// delay jitter) is byte-for-byte the same logic as the old serial loop.
+//
 // The dictionary is streamed from task.DictPath so a resumed session
 // always reflects the current file; its entry count must match the
-// recorded total. Streaming keeps memory O(1) in dictionary size, which
-// is what makes multi-million-entry generated dictionaries viable.
+// recorded total.
 //
 // Per-domain flow:
-//  1. DNS NS pre-check — NS records prove registration, skipping WHOIS.
-//  2. WHOIS query (with retries/backoff) unless disabled.
+//  1. DNS NS pre-check (worker pool) — NS records prove registration,
+//     skipping WHOIS entirely; DNS-uncertain domains fall into the queue.
+//  2. WHOIS query (serial consumer, retries/backoff) unless disabled.
 //  3. If WHOIS exhausts its retries (anti-crawl), the task degrades to
 //     DNS-only judgment for everything that follows; the flag persists so
 //     resumed sessions stay degraded.
@@ -493,55 +533,54 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		}
 	}()
 
-	// checkDomain runs one domain through DNS pre-check + WHOIS. It returns
-	// (ok, usedWhois): ok=false means ctx was cancelled mid-flight and
-	// nothing was recorded; usedWhois=false means the verdict came purely
-	// from DNS (NS hit, or WHOIS disabled) and the caller paces with the
-	// small -dns-interval; usedWhois=true means the WHOIS server was
-	// contacted, in which case WHOIS rate limiting is already enforced as a
-	// pre-query makeup wait inside this function and the caller does NOT
-	// add another post-query sleep.
-	checkDomain := func(i int, domain string) (bool, bool) {
-		// Step 1: DNS NS pre-check.
-		hasNS, dnsKnown := false, false
+	// checkDomain helpers run on the DNS worker pool (precheckDNS) or the
+	// serial WHOIS consumer (judgeWhois). Verdicts are recorded via persist
+	// (Record + SaveMeta), both concurrency-safe in the v3 state model.
+
+	// expiring log writer — only the WHOIS consumer writes it (single
+	// goroutine), so no extra locking is needed.
+	persist := func(i int, domain string, status state.Status, errMsg string) {
+		rerr := task.Record(i, domain, status, errMsg, 1)
+		if rerr == nil {
+			rerr = task.SaveMeta()
+		}
+		if rerr != nil {
+			eprintf("WARN could not save state: %v", rerr)
+		}
+	}
+
+	// dnsPrecheck resolves the NS question for one domain. It returns
+	// (nsHit, dnsKnown): dnsKnown=false means the lookup failed (nothing
+	// could be concluded).
+	dnsPrecheck := func(domain string) (nsHit, dnsKnown bool) {
 		nsHit, nsErr := nsChecker.HasNS(ctx, domain)
 		if nsErr != nil {
-			if ctx.Err() != nil { // Ctrl+C during the lookup
-				return false, false
+			if ctx.Err() == nil { // Ctrl+C: no need to warn
+				eprintf("WARN dns lookup failed for %s: %v", domain, nsErr)
 			}
-			eprintf("WARN dns lookup failed for %s: %v", domain, nsErr)
-		} else {
-			dnsKnown = true
-			hasNS = nsHit
+			return false, false
 		}
+		return nsHit, true
+	}
 
-		persist := func(status state.Status, errMsg string) {
-			rerr := task.Record(i, domain, status, errMsg, 1)
-			if rerr == nil {
-				rerr = task.SaveMeta()
-			}
-			if rerr != nil {
-				eprintf("WARN could not save state: %v", rerr)
-			}
-		}
+	// judgeWhois runs one domain through WHOIS (skipped when disabled).
+	// It returns (ok, usedWhois): ok=false means ctx was cancelled mid-
+	// flight and nothing was recorded; usedWhois=false means the verdict
+	// came purely from DNS (WHOIS disabled) and no WHOIS pacing applies.
+	judgeWhois := func(i int, domain string, dnsKnown bool) (bool, bool) {
 
-		if hasNS {
-			printf("%s is NOT available [dns]", domain)
-			persist(state.StatusUnavailableDNS, "")
-			return true, false
-		}
-
-		// Step 2: WHOIS — skipped entirely when disabled/unconfigured.
+		// WHOIS skipped entirely when disabled/unconfigured (DNS-only
+		// fallback for queued domains).
 		if task.WhoisDisabled {
 			if !dnsKnown {
 				eprintf("WARN %s cannot be judged (dns lookup failed, whois disabled)", domain)
-				persist(state.StatusFailed, "dns lookup failed and whois is disabled")
+				persist(i, domain, state.StatusFailed, "dns lookup failed and whois is disabled")
 				return true, false
 			}
 			printf("%s is available [dns, uncertain]", domain)
 			fmt.Fprintf(logFile, "%s is available [dns]\n", domain)
 			logFile.Flush()
-			persist(state.StatusAvailableDNS, "")
+			persist(i, domain, state.StatusAvailableDNS, "")
 			return true, false
 		}
 
@@ -583,10 +622,10 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 				printf("%s is available [dns, uncertain]", domain)
 				fmt.Fprintf(logFile, "%s is available [dns]\n", domain)
 				logFile.Flush()
-				persist(state.StatusAvailableDNS, "")
+				persist(i, domain, state.StatusAvailableDNS, "")
 			} else {
 				// Even DNS was unreachable: retryable on resume.
-				persist(state.StatusFailed, qerr.Error())
+				persist(i, domain, state.StatusFailed, qerr.Error())
 			}
 			return true, true // the whois server WAS contacted (that's why we degraded)
 		}
@@ -595,7 +634,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			printf("%s is available", domain)
 			fmt.Fprintf(logFile, "%s is available\n", domain)
 			logFile.Flush()
-			persist(state.StatusAvailable, "")
+			persist(i, domain, state.StatusAvailable, "")
 		} else if hasMark(resp, "redemptionperiod") {
 			// EPP redemptionPeriod: still registered but in the 30-day
 			// redemption grace period. It cannot be re-registered right
@@ -606,7 +645,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 				w.Flush()
 				expiringHasContent = true
 			}
-			persist(state.StatusRedemption, "")
+			persist(i, domain, state.StatusRedemption, "")
 		} else if hasMark(resp, "pendingdelete") {
 			// EPP pendingDelete: final ~5 days before the domain drops and
 			// becomes registerable again.
@@ -616,62 +655,150 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 				w.Flush()
 				expiringHasContent = true
 			}
-			persist(state.StatusPendingDelete, "")
+			persist(i, domain, state.StatusPendingDelete, "")
 		} else {
 			printf("%s is NOT available", domain)
-			persist(state.StatusUnavailable, "")
+			persist(i, domain, state.StatusUnavailable, "")
 		}
 		return true, true // authoritative answer from the whois server
 	}
 
-	for i := sess.Start; i < task.Total; i++ {
-		// Indices already settled in earlier sessions are skipped; the
-		// skip map covers only [cursor, progress), never the whole dict.
-		if sess.ShouldSkip(i) {
-			continue
+	// ---- two-queue pipeline ----
+	//
+	// queueItem is what the DNS pool hands to the WHOIS consumer: a
+	// domain whose NS pre-check came back empty (or failed). NS hits and
+	// DNS-only verdicts are settled right inside the workers.
+	type queueItem struct {
+		index    int
+		domain   string
+		dnsKnown bool // false = the pre-check itself failed
+	}
+
+	queueCap := opts.WhoisQueue
+	if queueCap <= 0 {
+		queueCap = DefaultWhoisQueue
+	}
+	queue := make(chan queueItem, queueCap)
+
+	producerDone := make(chan struct{})
+	var producerErr error
+	var producerErrMu sync.Mutex
+
+	// Producer: stream the dictionary through the DNS worker pool. Each
+	// worker paces its own queries with the full -dns-interval (per-worker
+	// semantics — 5 workers ≈ 5x DNS throughput; the shared resolver list
+	// is round-robin so they spread across servers).
+	workers := opts.DNS.Concurrency
+	if workers <= 0 {
+		workers = dns.DefaultConcurrency
+	}
+
+	// DNS worker pacing: each worker sleeps the full -dns-interval after
+	// a pre-check, independent of the others (per-worker semantics — N
+	// workers ≈ N QPS). This replaced the old single-loop post-verdict
+	// sleep, which had to sit inside the loop because there was only one
+	// goroutine.
+	paceAfterPrecheck := func() bool { // returns false when interrupted
+		if wait := opts.DNS.BaseDelay; wait > 0 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(wait):
+			}
 		}
+		return true
+	}
+
+	go func() {
+		defer close(producerDone)
+		sem := make(chan struct{}, workers)
+		var wg sync.WaitGroup
+		for i := sess.Start; i < task.Total; i++ {
+			// Checkpoint: stop feeding when interrupted or when the
+			// consumer died (e.g. dictionary read error).
+			if ctx.Err() != nil {
+				break
+			}
+			if sess.ShouldSkip(i) {
+				continue
+			}
+			domain, derr := prefixes.At(i)
+			if derr != nil {
+				// The dictionary shrank below its recorded total mid-run:
+				// the on-disk state stays valid; the count check reports
+				// the mismatch on resume.
+				producerErrMu.Lock()
+				producerErr = fmt.Errorf("read dictionary entry %d: %w", i, derr)
+				producerErrMu.Unlock()
+				break
+			}
+			domain += "." + task.TLD
+
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(i int, domain string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				nsHit, dnsKnown := dnsPrecheck(domain)
+				if ctx.Err() != nil {
+					return // interrupted mid-lookup: nothing recorded
+				}
+				if nsHit {
+					printf("%s is NOT available [dns]", domain)
+					persist(i, domain, state.StatusUnavailableDNS, "")
+					paceAfterPrecheck() // per-worker resolver cooldown
+					return
+				}
+				// DNS-uncertain (or lookup failed): hand to WHOIS. A
+				// full queue blocks here — backpressure keeps memory
+				// bounded on multi-million-entry dictionaries. No extra
+				// sleep: this item's verdict will be paced by the WHOIS
+				// consumer's makeup wait, and the next pre-check starts
+				// as soon as the semaphore slot frees.
+				select {
+				case queue <- queueItem{index: i, domain: domain, dnsKnown: dnsKnown}:
+				case <-ctx.Done():
+				}
+			}(i, domain)
+		}
+		wg.Wait()
+		close(queue)
+	}()
+
+	// Consumer: the serial WHOIS judge. Everything about WHOIS pacing is
+	// untouched — pre-query makeup wait, exponential backoff, degradation.
+	// It exits when the queue is closed and drained, or on cancellation.
+	// On cancellation any still-queued items are dropped: the producer
+	// stops soon after (its ctx check) and the process is exiting anyway.
+	for item := range queue {
 		if ctx.Err() != nil {
 			interrupted = true
-			break
+			continue // drain without querying: record nothing
 		}
-
-		domain, derr := prefixes.At(i)
-		if derr != nil {
-			// The dictionary shrank below its recorded total mid-run: the
-			// on-disk state (which points past this index) stays valid, and
-			// the count check above already reports the mismatch on resume.
-			return fmt.Errorf("read dictionary entry %d: %w", i, derr)
-		}
-		domain += "." + task.TLD
-		ok, usedWhois := checkDomain(i, domain)
+		ok, _ := judgeWhois(item.index, item.domain, item.dnsKnown)
 		if !ok {
 			interrupted = true
 			break
 		}
-
-		if i == task.Total-1 {
-			break // last domain: nothing left to pace
-		}
-
-		// Post-query pacing only applies to DNS-only verdicts: a small fixed
-		// gap keeps the DNS resolver from being hammered. When the WHOIS
-		// server was involved there is no post-query sleep here — WHOIS
-		// rate limiting is enforced as a pre-query makeup wait inside
-		// checkDomain, so the next domain's DNS pre-check starts right away
-		// and overlaps the WHOIS cooldown instead of stacking on top of it.
-		if !usedWhois {
-			if wait := opts.DNS.BaseDelay; wait > 0 {
-				select {
-				case <-ctx.Done():
-					interrupted = true
-				case <-time.After(wait):
-				}
-				if interrupted {
-					break
-				}
-			}
-		}
 	}
+
+	// Interrupt bookkeeping: a producer break on ctx also counts.
+	if ctx.Err() != nil {
+		interrupted = true
+	}
+	if producerErr != nil {
+		// Drain result: surface the dictionary error (matches the old
+		// abort-on-shrunk-dict behavior).
+		producerErrMu.Lock()
+		perr := producerErr
+		producerErrMu.Unlock()
+		<-producerDone
+		return perr
+	}
+	// Wait for the producer to finish (it closes the queue; the consumer
+	// above already exited its range, so just reap the goroutine).
+	<-producerDone
 
 	// Persist whatever we have before reporting.
 	if err := task.SaveMeta(); err != nil {
@@ -801,14 +928,14 @@ func pickResumable(opts Options, printf func(string, ...any)) (*state.Task, erro
 			return nil, fmt.Errorf("no unfinished tasks found in %s", filepath.Join(opts.DataDir, "state"))
 		}
 		t := tasks[0]
-		printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.Cursor(), t.Total)
+		printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.CheckedCount(), t.Total)
 		return t, nil
 	default:
 		t, err := state.Load(sel)
 		if err != nil {
 			return nil, err
 		}
-		printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.Cursor(), t.Total)
+		printf("Resuming %s_%s (%d of %d domains checked)", t.TLD, t.DictName, t.CheckedCount(), t.Total)
 		return t, nil
 	}
 }

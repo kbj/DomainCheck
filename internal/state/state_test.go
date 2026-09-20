@@ -51,11 +51,13 @@ func TestSequentialRecordingWithMidwayFailure(t *testing.T) {
 		}
 	}
 
-	must(tk.Record(0, "abc.xyz", StatusAvailable, "", 1))   // P=1
-	must(tk.Record(1, "bcd.xyz", StatusFailed, "boom", 5))  // P=2, F={1}
-	must(tk.Record(2, "cde.xyz", StatusUnavailable, "", 1)) // P=3
+	must(tk.Record(0, "abc.xyz", StatusAvailable, "", 1))   // settled={0}, P=1
+	must(tk.Record(1, "bcd.xyz", StatusFailed, "boom", 5))  // F={1}, stays unsettled
+	must(tk.Record(2, "cde.xyz", StatusUnavailable, "", 1)) // settled={0,2}, P=2
 
-	if tk.Progress != 3 || len(tk.Failed) != 1 || tk.Failed[0].Index != 1 {
+	// Failed entries no longer advance Progress (v3): settled counts
+	// definitive outcomes only, so the retryable failure stays unsettled.
+	if tk.Progress != 2 || len(tk.Failed) != 1 || tk.Failed[0].Index != 1 {
 		t.Fatalf("progress=%d failed=%+v", tk.Progress, tk.Failed)
 	}
 	if c := tk.Cursor(); c != 1 {
@@ -96,6 +98,8 @@ func TestBeginSessionSkipsSettledIndices(t *testing.T) {
 	if sess.Start != 1 {
 		t.Fatalf("start=%d want 1", sess.Start)
 	}
+	// only index 2 (available) is settled; index 1 (failed) must be
+	// re-checked, and index 3 is beyond Total=3.
 	if !sess.ShouldSkip(2) || sess.ShouldSkip(1) || sess.ShouldSkip(3) {
 		t.Fatalf("skip flags wrong: settled=%v", sess.Settled)
 	}
@@ -109,7 +113,9 @@ func TestBeginSessionSkipsSettledIndices(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer re.CloseJournal()
-	if re.Progress != 3 || len(re.Failed) != 1 || re.Failed[0].Index != 1 {
+	// v3: Progress counts definitive outcomes only — the two available
+	// records; the failed entry stays unsettled and retryable.
+	if re.Progress != 2 || len(re.Failed) != 1 || re.Failed[0].Index != 1 {
 		t.Fatalf("reload after session start: progress=%d failed=%+v", re.Progress, re.Failed)
 	}
 }
@@ -376,6 +382,61 @@ func TestLoadRejectsCorrupt(t *testing.T) {
 	}
 }
 
+// TestUnorderedRecordingAndRebuild mirrors the two-queue scan: verdicts
+// arrive in arbitrary order (DNS workers run ahead of the WHOIS consumer),
+// the settled count must be order-independent, and a SaveMeta + Load
+// roundtrip must rebuild the Settled bitmap exactly from the journal.
+func TestUnorderedRecordingAndRebuild(t *testing.T) {
+	tk := newTestTask(t)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Deliberately out of dictionary order.
+	must(tk.Record(2, "c", StatusUnavailable, "", 1))
+	must(tk.Record(0, "a", StatusAvailable, "", 1))
+	must(tk.Record(1, "b", StatusFailed, "boom", 2)) // failed: unsettled
+
+	if tk.Progress != 2 {
+		t.Fatalf("settled count %d, want 2", tk.Progress)
+	}
+	if c := tk.Cursor(); c != 1 {
+		t.Fatalf("cursor=%d want 1 (failed index)", c)
+	}
+
+	if err := tk.SaveMeta(); err != nil {
+		t.Fatal(err)
+	}
+	tk.CloseJournal()
+	got, err := Load(tk.metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.CloseJournal()
+	want := []byte{1, 0, 1}
+	for i := range want {
+		if got.Settled[i] != want[i] {
+			t.Fatalf("rebuilt settled=%v, want %v", got.Settled, want)
+		}
+	}
+	if got.Progress != 2 {
+		t.Fatalf("rebuilt progress=%d, want 2", got.Progress)
+	}
+
+	// duplicate settled re-record is rejected even unordered
+	if err := got.Record(2, "c", StatusAvailable, "", 1); err == nil {
+		t.Fatal("duplicate settled record must be rejected")
+	}
+	// and the failed index can still be retried to completion
+	must(got.Record(1, "b", StatusAvailable, "", 3))
+	if !got.Done() {
+		t.Fatal("task should be done after retry settles the failure")
+	}
+}
+
 func TestRecordValidation(t *testing.T) {
 	tk := newTestTask(t)
 	if err := tk.Record(99, "x", StatusAvailable, "", 1); err == nil {
@@ -384,25 +445,30 @@ func TestRecordValidation(t *testing.T) {
 	if err := tk.Record(0, "x", StatusPending, "", 1); err == nil {
 		t.Fatal("expected invalid-status error")
 	}
-	if err := tk.Record(1, "b", StatusFailed, "e", 1); err == nil {
-		t.Fatal("non-sequential failed record should be rejected")
+	// v3: records may arrive out of order (DNS workers run ahead of the
+	// WHOIS consumer); an unordered failure is now accepted.
+	if err := tk.Record(1, "b", StatusFailed, "e", 1); err != nil {
+		t.Fatalf("unordered failed record should be accepted: %v", err)
 	}
-
-	// normal sequential flow: ok, fail (frontier advances past it), then
-	// a retry-fix below the frontier, then continue at the frontier.
+	// re-recording a settled index is still an ordering bug
 	if err := tk.Record(0, "a", StatusAvailable, "", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := tk.Record(1, "b", StatusFailed, "e", 1); err != nil {
-		t.Fatal(err)
+	if err := tk.Record(0, "a", StatusAvailable, "", 2); err == nil {
+		t.Fatal("duplicate conclusive record should be rejected")
 	}
-	if err := tk.Record(1, "b", StatusFailed, "e2", 2); err != nil {
+	if err := tk.Record(0, "a", StatusFailed, "e", 1); err == nil {
+		t.Fatal("failing a settled record should be rejected")
+	}
+
+	// normal flow: fail first (stays unsettled), retry-fix settles it.
+	if err := tk.Record(2, "c", StatusFailed, "e2", 2); err != nil {
 		t.Fatalf("upserting an existing failure should be accepted: %v", err)
 	}
-	if err := tk.Record(1, "b", StatusAvailable, "", 3); err != nil {
-		t.Fatalf("retry-fix below frontier should be accepted: %v", err)
+	if err := tk.Record(2, "c", StatusAvailable, "", 3); err != nil {
+		t.Fatalf("retry-fix should be accepted: %v", err)
 	}
-	if err := tk.Record(1, "b", StatusAvailable, "", 4); err == nil {
+	if err := tk.Record(2, "c", StatusAvailable, "", 4); err == nil {
 		t.Fatal("duplicate conclusive record should be rejected")
 	}
 }
@@ -432,7 +498,7 @@ func TestMigrateV1(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	defer tk.CloseJournal()
-	if tk.Version != currentVersion || tk.Total != 3 || tk.Progress != 2 || len(tk.Failed) != 1 {
+	if tk.Version != currentVersion || tk.Total != 3 || tk.Progress != 1 || len(tk.Failed) != 1 {
 		t.Fatalf("migrated task wrong: progress=%d failed=%+v", tk.Progress, tk.Failed)
 	}
 	if tk.Cursor() != 1 {

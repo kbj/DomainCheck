@@ -1,28 +1,39 @@
 // Package state implements crash-safe persistence for a scan task.
 //
-// Design (v2), built to scale to dictionaries with millions of entries:
+// Design (v3), built to scale to dictionaries with millions of entries:
 //
 //   - The metadata file (*.state.json) holds only the task configuration and
-//     a tiny amount of progress bookkeeping: a "progress" watermark plus the
-//     sparse set of failed indices. Its size is O(#failures), typically a few
-//     hundred bytes regardless of dictionary size. It is rewritten atomically
-//     (temp file + rename) after every domain.
+//     a tiny amount of progress bookkeeping: a settled-count summary plus
+//     the sparse set of failed indices. Its size is O(#failures), typically
+//     a few hundred bytes regardless of dictionary size. It is rewritten
+//     atomically (temp file + rename) after every domain.
 //   - The journal file (*.journal) is append-only: one line per checked
 //     domain with its outcome. Appending is O(1) and preserves the full
 //     history for auditing without ever holding it in memory.
 //
 // Progress invariant at rest:
 //
-//	every index i < Progress has a conclusive record in the journal
-//	(available / unavailable / failed); exactly the Failed members are
-//	not conclusive.
+//	every index i with Settled[i]==1 has a conclusive record in the journal
+//	(available / unavailable / redemption / pending-delete / failed);
+//	exactly the Failed members are not conclusive.
 //
-// The resume cursor is therefore min(Failed[0].Index, Progress).
+// The resume cursor is the first index with Settled[i]==0.
+//
+// v3 note: records no longer arrive strictly in dictionary order — the
+// two-queue scan runs a DNS pre-check worker pool ahead of the serial
+// WHOIS consumer, so verdicts (including failures) may be recorded out of
+// order. The in-memory Settled bitmap marks conclusive outcomes per index;
+// Progress is its popcount (definitive-only). The bitmap itself is NOT
+// persisted — the journal is the authoritative history and Settled is
+// rebuilt from it on Load, keeping the meta file O(#failures) small and
+// making progress self-healing after a crash (whatever the journal holds
+// is exactly what is settled).
 //
 // Memory usage of the persisted state is O(1) w.r.t. dictionary size (plus
-// the O(#failures) list); only the caller's own prefix slice scales with the
-// dictionary. Counts() is the one exception: it streams the journal and uses
-// one byte of memory per dictionary entry.
+// the O(#failures) list); the caller's prefix slice and the in-memory
+// Settled bitmap scale with the dictionary (one byte per entry, same order
+// as the status array Counts() already uses). Counts() is the one other
+// exception: it streams the journal.
 package state
 
 import (
@@ -34,6 +45,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -63,7 +75,7 @@ const (
 	StatusAvailableDNS   Status = "available-dns"
 )
 
-const currentVersion = 2
+const currentVersion = 3
 
 // Definitive reports whether s is a final answer that does not need to be
 // re-checked on resume.
@@ -85,7 +97,7 @@ type FailedEntry struct {
 // Task is the persistent state of one scan. Everything except Failed scales
 // O(1) with dictionary size.
 type Task struct {
-	Version      int    `json:"version"` // state format version, currently 2
+	Version      int    `json:"version"` // state format version, currently 3
 	TLD          string `json:"tld"`
 	DictName     string `json:"dict"`
 	DictPath     string `json:"dict_path"` // where prefixes are reloaded from on resume
@@ -98,8 +110,8 @@ type Task struct {
 	UpdatedAt time.Time `json:"updated_at"`
 
 	Total         int           `json:"total"`          // number of dict entries
-	Progress      int           `json:"progress"`       // see package doc invariant
-	Failed        []FailedEntry `json:"failed"`         // sorted by Index; subset of [0,Progress)
+	Progress      int           `json:"progress"`       // definitively settled count (display summary)
+	Failed        []FailedEntry `json:"failed"`         // sorted by Index; retryable
 	HeaderWritten bool          `json:"header_written"` // log header already emitted
 
 	// WhoisDisabled marks a task that judges domains purely by DNS NS
@@ -107,6 +119,15 @@ type Task struct {
 	// server's anti-crawl defenses exhausted the retry budget mid-run.
 	WhoisDisabled bool `json:"whois_disabled,omitempty"`
 
+	// Settled is the in-memory per-index bitmap of definitive outcomes.
+	// NOT persisted: rebuilt from the journal on Load (the journal is the
+	// authoritative history, keeping the meta file O(#failures) small).
+	// Mutated under settledMu by Record / migrations.
+	Settled []byte `json:"-"`
+
+	// settledMu guards Settled/Progress/Failed: DNS pre-check workers
+	// record verdicts concurrently while the WHOIS consumer runs.
+	settledMu   sync.Mutex
 	metaPath    string
 	journalPath string
 	journal     *bufio.Writer
@@ -140,6 +161,7 @@ func New(cfg Config) (*Task, error) {
 		Total:        cfg.Total,
 		metaPath:     cfg.StatePath,
 		journalPath:  cfg.JournalPath,
+		Settled:      make([]byte, cfg.Total),
 	}
 	if err := t.openJournal(false); err != nil {
 		return nil, err
@@ -153,37 +175,27 @@ func New(cfg Config) (*Task, error) {
 // BeginSession computes the resume cursor and prepares skip information so
 // the scan loop re-checks only domains that lack a conclusive result.
 //
-// It streams the journal once to mark which indices in [cursor, Progress)
-// are already settled (those get skipped); typical region size is small.
-// The returned Session holds that temporary map; memory is O(region), not
-// O(dictionary).
+// The returned Session holds a fresh copy of the settled bitmap covering
+// [Start, Total); memory is O(dictionary) — one byte per entry, same order
+// as the status array Counts() already uses.
 func (t *Task) BeginSession() (*Session, error) {
 	if err := t.journalFlush(); err != nil {
 		return nil, err
 	}
-	start := t.Cursor()
-	s := &Session{Start: start}
-	if t.Progress > start {
-		s.Settled = make([]byte, t.Progress-start)
-		f, err := os.Open(t.journalPath)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("state: open journal %s: %w", t.journalPath, err)
-		}
-		if f != nil {
-			defer f.Close()
-			sc := bufio.NewScanner(f)
-			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-			for sc.Scan() {
-				idx, st, ok := parseJournalLine(sc.Text())
-				if ok && st.Definitive() && idx >= start && idx < t.Progress {
-					s.Settled[idx-start] = 1
-				}
-			}
-			if err := sc.Err(); err != nil {
-				return nil, fmt.Errorf("state: read journal %s: %w", t.journalPath, err)
-			}
+	t.settledMu.Lock()
+	// The bitmap may be sparse (DNS workers settle out of order), so the
+	// resume start is the FIRST zero bit, not the settled count. Failed
+	// indices are zeros too, so they get re-checked — the v2 semantics.
+	start := len(t.Settled)
+	for i, s := range t.Settled {
+		if s == 0 {
+			start = i
+			break
 		}
 	}
+	s := &Session{Start: start, Settled: make([]byte, len(t.Settled))}
+	copy(s.Settled, t.Settled)
+	t.settledMu.Unlock()
 	return s, nil
 }
 
@@ -191,48 +203,50 @@ func (t *Task) BeginSession() (*Session, error) {
 type Session struct {
 	// Start is the first index to examine.
 	Start int
-	// Settled[i-Start] == 1 means index i already has a definitive result
-	// and must be skipped. Only covers [Start, Progress).
+	// Settled is the per-index bitmap of definitive outcomes, indexed by
+	// ABSOLUTE dictionary index (a copy of Task.Settled at BeginSession
+	// time). Failed indices are 0 so resume re-checks them.
 	Settled []byte
 }
 
-// ShouldSkip reports whether index i needs no further query.
+// ShouldSkip reports whether index i needs no further query. Absolute
+// addressing: an index beyond the bitmap or below Start is not skippable.
 func (s *Session) ShouldSkip(i int) bool {
-	j := i - s.Start
-	return j >= 0 && j < len(s.Settled) && s.Settled[j] == 1
+	return i >= 0 && i < len(s.Settled) && s.Settled[i] == 1
 }
 
 // Record persists one domain outcome: appended to the journal (O(1)) and
 // folded into the in-memory bookkeeping. Call SaveMeta afterwards to make
 // the progress durable. domain is the queried name (used for failure records).
 //
-// Definitive results must arrive sequentially at the frontier (idx ==
-// Progress, the normal flow) or below it (a previously failed index being
-// retried); anything beyond the frontier is an ordering bug and rejected.
+// Records may arrive out of order (the two-queue scan runs DNS pre-checks
+// ahead of the serial WHOIS consumer), so there is no sequential-frontier
+// check. Anything already settled is rejected as a duplicate — except a
+// failed retry upserting its own earlier entry (Settled[i]==1 while the
+// index still sits in Failed) or that retry later succeeding (failed →
+// definitive upgrade).
 func (t *Task) Record(idx int, domain string, status Status, errMsg string, attempts int) error {
 	if idx < 0 || idx >= t.Total {
 		return fmt.Errorf("state: index %d out of range [0,%d)", idx, t.Total)
 	}
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
+
+	isFailed := status == StatusFailed
+	if !isFailed && !status.Definitive() {
+		return fmt.Errorf("state: unexpected status %q", status)
+	}
+	if t.Settled[idx] == 1 {
+		// Definitively settled; recording over it is an ordering bug. The
+		// failed→definitive upgrade path never lands here: Settled is only
+		// set on definitive outcomes, and a retried failure's first
+		// recording left it unset.
+		return fmt.Errorf("state: duplicate conclusive record %d", idx)
+	}
 	if err := t.writeJournal(idx, status, errMsg, attempts); err != nil {
 		return err
 	}
-	switch status {
-	case StatusAvailable, StatusUnavailable, StatusRedemption, StatusPendingDelete,
-		StatusAvailableDNS, StatusUnavailableDNS:
-		if idx > t.Progress {
-			return fmt.Errorf("state: non-sequential definitive record %d (progress=%d)", idx, t.Progress)
-		}
-		if idx < t.Progress && !t.inFailed(idx) {
-			return fmt.Errorf("state: duplicate conclusive record %d", idx)
-		}
-		t.removeFailed(idx)
-		if idx == t.Progress {
-			t.Progress++
-		}
-	case StatusFailed:
-		if idx > t.Progress {
-			return fmt.Errorf("state: non-sequential failed record %d (progress=%d)", idx, t.Progress)
-		}
+	if isFailed {
 		t.upsertFailed(FailedEntry{
 			Index:    idx,
 			Domain:   domain,
@@ -240,19 +254,22 @@ func (t *Task) Record(idx int, domain string, status Status, errMsg string, atte
 			Error:    errMsg,
 			At:       time.Now(),
 		})
-		if idx == t.Progress {
-			t.Progress++ // frontier moved past the failure; it stays in Failed
-		}
-	default:
-		return fmt.Errorf("state: unexpected status %q", status)
+	} else {
+		t.removeFailed(idx)
+		t.Settled[idx] = 1
+		t.Progress++ // settled count (order-independent)
 	}
 	t.touch()
 	return nil
 }
 
 // SaveMeta flushes the journal buffer and atomically rewrites the metadata
-// file (a few hundred bytes, independent of dictionary size).
+// file (a few hundred bytes, independent of dictionary size). Safe for
+// concurrent use: DNS pre-check workers and the WHOIS consumer both call
+// it, so the journal flush and the meta snapshot are serialized.
 func (t *Task) SaveMeta() error {
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
 	t.touch()
 	if err := t.journalFlush(); err != nil {
 		return err
@@ -277,13 +294,32 @@ func (t *Task) CloseJournal() {
 	}
 }
 
-// Cursor is the index a fresh session would resume from: the first index
-// without a conclusive result.
-func (t *Task) Cursor() int {
-	if len(t.Failed) > 0 && t.Failed[0].Index < t.Progress {
-		return t.Failed[0].Index
+// CheckedCount is the number of conclusively judged domains (definitively
+// settled plus retryable failures) — the display counterpart of the
+// resume start (the first zero bit of Settled).
+func (t *Task) CheckedCount() int {
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
+	n := 0
+	for _, s := range t.Settled {
+		n += int(s)
 	}
-	return t.Progress
+	return n + len(t.Failed)
+}
+
+// Cursor is the index a fresh session would resume from: the first index
+// without a definitive result (the first zero of the Settled bitmap). A
+// fully settled task yields Total. Failed indices are unsettled by design,
+// so the cursor lands on them for re-checking.
+func (t *Task) Cursor() int {
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
+	for i, s := range t.Settled {
+		if s == 0 {
+			return i
+		}
+	}
+	return len(t.Settled)
 }
 
 // MetaPath returns the metadata file path this task was loaded from / saved to.
@@ -292,8 +328,10 @@ func (t *Task) MetaPath() string { return t.metaPath }
 // JournalPath returns the append-only journal file path.
 func (t *Task) JournalPath() string { return t.journalPath }
 
-// Done reports whether every domain has been conclusively checked.
-func (t *Task) Done() bool { return t.Progress >= t.Total && len(t.Failed) == 0 }
+// Done reports whether every domain has been conclusively checked: the
+// settled bitmap is full (no retryable failure outstanding) and no failure
+// entry remains.
+func (t *Task) Done() bool { return t.Progress == t.Total && len(t.Failed) == 0 }
 
 // Counts tallies outcomes. Available/unavailable come from streaming the
 // journal (O(1) memory); pending is derived.
@@ -384,6 +422,16 @@ func (t *Task) Counts() (Counts, error) {
 		c.Pending = 0
 	}
 	return c, nil
+}
+
+// recount recomputes Progress as the settled popcount. Caller must hold
+// settledMu (migrations use it single-threaded before any concurrency).
+func (t *Task) recount() {
+	n := 0
+	for _, s := range t.Settled {
+		n += int(s)
+	}
+	t.Progress = n
 }
 
 // ---- persistence helpers ----
@@ -487,9 +535,9 @@ func atomicWrite(path string, data []byte) error {
 
 // ---- loading & migration ----
 
-// Load reads a task's metadata. v2 files load directly; legacy v1 files
-// (which embedded every result) are migrated once to the v2 meta+journal
-// format.
+// Load reads a task's metadata. v3 files load directly; v2 files (watermark
+// Progress without a Settled bitmap) and legacy v1 files (which embedded
+// every result) are migrated once to the current format.
 func Load(path string) (*Task, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -503,12 +551,55 @@ func Load(path string) (*Task, error) {
 	}
 	switch probe.Version {
 	case currentVersion:
-		return loadV2(path, data)
+		return loadV3(path, data)
+	case 2:
+		return migrateV2(path, data)
 	case 1:
 		return migrateV1(path, data)
 	default:
 		return nil, fmt.Errorf("state: %s: unsupported version %d", path, probe.Version)
 	}
+}
+
+// loadV3 reads a v3 task and rebuilds the in-memory Settled bitmap from
+// the journal (the authoritative history; see package doc).
+func loadV3(path string, data []byte) (*Task, error) {
+	t, err := loadV2(path, data)
+	if err != nil {
+		return nil, err
+	}
+	defer t.CloseJournal()
+	t.Settled = make([]byte, t.Total)
+	f, err := os.Open(t.journalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return t, nil // fresh task: nothing settled yet
+		}
+		return nil, fmt.Errorf("state: %s: open journal: %w", path, err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		idx, st, ok := parseJournalLine(sc.Text())
+		if ok && st.Definitive() && idx >= 0 && idx < t.Total {
+			t.Settled[idx] = 1 // failed lines stay unsettled: re-checked on resume
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("state: %s: read journal: %w", path, err)
+	}
+	t.recount()
+	return t, nil
+}
+
+// migrateV2 upgrades a v2 state (sequential-frontier Progress, no Settled
+// bitmap) to v3. One pass, O(N): the journal replay marks definitively
+// settled indices; failed entries stay unsettled so resume re-checks them
+// (same semantics as v2's cursor). The old watermark is ignored — the
+// replay is authoritative.
+func migrateV2(path string, data []byte) (*Task, error) {
+	return loadV3(path, data) // same rebuild; version field is rewritten below
 }
 
 func loadV2(path string, data []byte) (*Task, error) {
@@ -578,6 +669,7 @@ func migrateV1(path string, data []byte) (*Task, error) {
 		CreatedAt:     old.CreatedAt,
 		UpdatedAt:     time.Now(),
 		Total:         len(old.Prefixes),
+		Settled:       make([]byte, len(old.Prefixes)),
 		metaPath:      path,
 		journalPath:   strings.TrimSuffix(path, ".state.json") + ".journal",
 		HeaderWritten: true,
@@ -586,9 +678,8 @@ func migrateV1(path string, data []byte) (*Task, error) {
 		return nil, err
 	}
 	// Replay every known result into the journal, then derive Progress/Failed.
-	// Mirrors Record's rules: both definitive and failed entries advance the
-	// frontier; only definitive ones leave the failed set.
-	highWater := 0
+	// Mirrors Record's rules: definitive entries settle their index; failed
+	// ones join the retry list but stay unsettled (re-checked on resume).
 	for i, r := range old.Results {
 		st := r.Status
 		if !st.Definitive() && st != StatusFailed {
@@ -604,17 +695,12 @@ func migrateV1(path string, data []byte) (*Task, error) {
 		switch {
 		case st.Definitive():
 			t.removeFailed(i)
-			if i+1 > highWater {
-				highWater = i + 1
-			}
+			t.Settled[i] = 1
+			t.Progress++
 		case st == StatusFailed:
 			t.upsertFailed(FailedEntry{Index: i, Domain: r.Domain, Attempts: attempts, Error: r.Error, At: r.CheckedAt})
-			if i+1 > highWater {
-				highWater = i + 1
-			}
 		}
 	}
-	t.Progress = highWater
 	if err := t.SaveMeta(); err != nil {
 		return nil, err
 	}

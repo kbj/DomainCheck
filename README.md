@@ -38,9 +38,14 @@ DomainCheck/
 3. 若某后缀的 WHOIS 服务器反爬严格、重试预算耗尽，任务自动**降级为仅 DNS 判断模式**
    （不再请求该 WHOIS 服务器），降级状态会持久化，续扫时保持；此类结果带
    `[dns, uncertain]` 标记；
-4. 扫描 `tld.json` 未配置的后缀时同样仅用 DNS 判断，启动时会显著提示该判断
+4. WHOIS 响应中若带有 EPP 状态码 **`redemptionPeriod`（赎回期）** 或
+   **`pendingDelete`（待删除）**，会单独识别并展示——这两类域名仍处于注册局
+   删除流程中，不能立即注册，但即将掉落；赎回期/待删除域名已从 zone 摘除、
+   查不到 NS 记录，因此与可注册域名一样回落到 WHOIS 查询后在此区分；
+   这两类域名会额外记录到独立的 `.expiring.log`（与可注册域名的主日志分开）；
+5. 扫描 `tld.json` 未配置的后缀时同样仅用 DNS 判断，启动时会显著提示该判断
    **不完全可靠**（已注册但未设置解析的域名看起来与可注册域名相同）；交互模式下需确认；
-5. DNS 查询与 WHOIS 一样遵循 `-delay` 抖动延迟规则，自身失败也有指数退避重试。
+6. DNS 查询与 WHOIS 一样遵循 `-delay` 抖动延迟规则，自身失败也有指数退避重试。
 
 可用 `-dns` 指定自定义解析器（默认走系统配置），支持多服务器轮询与
 DoT / DoH 加密传输，详见[「DNS 解析器配置」](#dns-解析器配置)。
@@ -90,6 +95,8 @@ Task Start
 ****************
 bo.xyz is available #可以注册的域名
 bai.xyz is NOT available #不可注册的域名
+to.xyz is in redemption period (NOT available) #赎回期（EPP redemptionPeriod）
+de.xyz is pending delete (NOT available) #待删除期（EPP pendingDelete）
 ```
 
 如果有未完成的任务，启动时会先列出这些任务，输入编号即可断点续扫，
@@ -176,6 +183,8 @@ bai.xyz is NOT available #不可注册的域名
 
 `result`输出目录：
 - `<tld>_<dict>_<时间>.log`：结果日志，格式与原版完全一致（仅记录可注册域名）
+- `<tld>_<dict>_<时间>.expiring.log`：赎回期/待删除域名单独记录（惰性创建——
+  扫描中未发现这类域名时不会生成该文件）
 - `<tld>_<dict>_<时间>.journal`：追加式逐域名历史（含 dns 来源标记）
 - `<tld>_<dict>_<时间>.state.json`：轻量元数据（几百字节，与字典规模无关），
   只存任务配置、进度水位和失败列表；每查完一个域名原子性重写一次

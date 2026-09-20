@@ -47,6 +47,14 @@ const (
 	StatusUnavailable Status = "unavailable"
 	StatusFailed      Status = "failed" // retries exhausted; retried on resume
 
+	// Expiry-phase results from the WHOIS server: the domain is still
+	// registered (NOT available) but sitting in a deletion pipeline.
+	//   redemption:      EPP redemptionPeriod — 30-day redemption grace period;
+	//   pending-delete:  EPP pendingDelete — final 5 days before dropping.
+	// Both are definitive (an expiry phase never reverts to available).
+	StatusRedemption    Status = "redemption"
+	StatusPendingDelete Status = "pending-delete"
+
 	// DNS-derived results (less authoritative):
 	//   unavailable-dns: NS records exist -> definitely registered;
 	//   available-dns:   no NS records -> PROBABLY available, but registered
@@ -61,6 +69,7 @@ const currentVersion = 2
 // re-checked on resume.
 func (s Status) Definitive() bool {
 	return s == StatusAvailable || s == StatusUnavailable ||
+		s == StatusRedemption || s == StatusPendingDelete ||
 		s == StatusAvailableDNS || s == StatusUnavailableDNS
 }
 
@@ -208,7 +217,8 @@ func (t *Task) Record(idx int, domain string, status Status, errMsg string, atte
 		return err
 	}
 	switch status {
-	case StatusAvailable, StatusUnavailable, StatusAvailableDNS, StatusUnavailableDNS:
+	case StatusAvailable, StatusUnavailable, StatusRedemption, StatusPendingDelete,
+		StatusAvailableDNS, StatusUnavailableDNS:
 		if idx > t.Progress {
 			return fmt.Errorf("state: non-sequential definitive record %d (progress=%d)", idx, t.Progress)
 		}
@@ -290,6 +300,8 @@ func (t *Task) Done() bool { return t.Progress >= t.Total && len(t.Failed) == 0 
 type Counts struct {
 	Available      int
 	Unavailable    int
+	Redemption     int // WHOIS says EPP redemptionPeriod (still registered)
+	PendingDelete  int // WHOIS says EPP pendingDelete (about to drop)
 	AvailableDNS   int // uncertain: no NS records seen
 	UnavailableDNS int // certain: NS records exist
 	Failed         int
@@ -318,6 +330,8 @@ func (t *Task) Counts() (Counts, error) {
 		stUnknown = iota
 		stAvailable
 		stUnavailable
+		stRedemption
+		stPendingDelete
 		stAvailableDNS
 		stUnavailableDNS
 	)
@@ -334,6 +348,10 @@ func (t *Task) Counts() (Counts, error) {
 			status[idx] = stAvailable // last line wins
 		case StatusUnavailable:
 			status[idx] = stUnavailable
+		case StatusRedemption:
+			status[idx] = stRedemption
+		case StatusPendingDelete:
+			status[idx] = stPendingDelete
 		case StatusAvailableDNS:
 			status[idx] = stAvailableDNS
 		case StatusUnavailableDNS:
@@ -349,13 +367,18 @@ func (t *Task) Counts() (Counts, error) {
 			c.Available++
 		case stUnavailable:
 			c.Unavailable++
+		case stRedemption:
+			c.Redemption++
+		case stPendingDelete:
+			c.PendingDelete++
 		case stAvailableDNS:
 			c.AvailableDNS++
 		case stUnavailableDNS:
 			c.UnavailableDNS++
 		}
 	}
-	c.Checked = c.Available + c.Unavailable + c.AvailableDNS + c.UnavailableDNS
+	c.Checked = c.Available + c.Unavailable + c.Redemption + c.PendingDelete +
+		c.AvailableDNS + c.UnavailableDNS
 	c.Pending = t.Total - c.Checked - c.Failed
 	if c.Pending < 0 { // defensive: should not happen
 		c.Pending = 0
@@ -645,6 +668,13 @@ func LogPath(dir, tld, dictName string, startTime time.Time) string {
 // JournalPath pairs with a state path: <...>.journal
 func JournalPath(statePath string) string {
 	return strings.TrimSuffix(statePath, ".state.json") + ".journal"
+}
+
+// ExpiringLogPath pairs with a result log path: <...>.expiring.log. It holds
+// the expiry-phase verdicts (redemption / pending-delete) apart from the
+// available-only main log.
+func ExpiringLogPath(logPath string) string {
+	return strings.TrimSuffix(logPath, ".log") + ".expiring.log"
 }
 
 func sanitize(name string) string {

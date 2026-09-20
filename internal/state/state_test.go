@@ -140,6 +140,33 @@ func TestCountsFromJournal(t *testing.T) {
 	}
 }
 
+func TestExpiryStatusesAdvanceProgress(t *testing.T) {
+	tk := newTestTask(t)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	must(tk.Record(0, "abc.xyz", StatusRedemption, "", 1))    // P=1
+	must(tk.Record(1, "bcd.xyz", StatusPendingDelete, "", 1)) // P=2
+	must(tk.Record(2, "cde.xyz", StatusUnavailable, "", 1))   // P=3
+
+	if tk.Progress != 3 || tk.Cursor() != 3 || !tk.Done() {
+		t.Fatalf("expiry-phase statuses are definitive: progress=%d cursor=%d done=%v",
+			tk.Progress, tk.Cursor(), tk.Done())
+	}
+	c, err := tk.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Redemption != 1 || c.PendingDelete != 1 || c.Unavailable != 1 ||
+		c.Checked != 3 || c.Pending != 0 {
+		t.Fatalf("counts mismatch: %+v", c)
+	}
+}
+
 func TestDNSStatusesAdvanceProgress(t *testing.T) {
 	tk := newTestTask(t)
 	must := func(err error) {

@@ -261,8 +261,8 @@ func interactiveStart(ctx context.Context, opts Options, registry *config.Regist
 			line := fmt.Sprintf("  [%d] %s/%s  progress:%d/%d failed:%d",
 				i+1, t.TLD, t.DictName, t.Cursor(), t.Total, len(t.Failed))
 			if c, cerr := t.Counts(); cerr == nil {
-				line += fmt.Sprintf(" available:%d unavailable:%d pending:%d",
-					c.Available, c.Unavailable, c.Pending)
+				line += fmt.Sprintf(" available:%d unavailable:%d redemption:%d pending-delete:%d pending:%d",
+					c.Available, c.Unavailable, c.Redemption, c.PendingDelete, c.Pending)
 			}
 			printf("%s", line)
 		}
@@ -451,6 +451,48 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	// history (resumes are typically long after the last query anyway).
 	var lastWhoisDone time.Time
 
+	// Expiry-phase log (<tld>_<dict>_<time>.expiring.log): redemption and
+	// pending-delete domains go here, apart from the available-only main
+	// log. Opened lazily on the first verdict; a scan that finds none
+	// never creates the file. expiringHasContent tracks whether the file
+	// carries (or already carried, from a previous session) any entries,
+	// which decides whether the "Task Done" footer is appended.
+	expiringPath := state.ExpiringLogPath(task.LogPath)
+	var expiringF *os.File
+	var expiringW *bufio.Writer
+	expiringHasContent := false
+	if fi, err := os.Stat(expiringPath); err == nil && fi.Size() > 0 {
+		expiringHasContent = true // previous session left entries behind
+	}
+	expiringOpen := func() *bufio.Writer {
+		if expiringW != nil {
+			return expiringW
+		}
+		f, err := openLog(expiringPath)
+		if err != nil {
+			eprintf("WARN could not open %s: %v", expiringPath, err)
+			return nil
+		}
+		w := bufio.NewWriter(f)
+		expiringF, expiringW = f, w
+		// Header only for a fresh file: on resume the previous session's
+		// entries are already there and must not get a second header.
+		if fi, serr := os.Stat(expiringPath); serr != nil || fi.Size() == 0 {
+			fmt.Fprintf(w, "TLD: %s Dict: %s Delay: %d Time: %s",
+				task.TLD, task.DictName, task.DelaySeconds, time.Now().Format("2006-01-02-15-04-05"))
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, separator)
+		}
+		return w
+	}
+	defer func() {
+		if expiringW != nil {
+			expiringW.Flush()
+			expiringF.Sync()
+			expiringF.Close()
+		}
+	}()
+
 	// checkDomain runs one domain through DNS pre-check + WHOIS. It returns
 	// (ok, usedWhois): ok=false means ctx was cancelled mid-flight and
 	// nothing was recorded; usedWhois=false means the verdict came purely
@@ -518,7 +560,7 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		}
 
 		resp, qerr := client.Query(ctx, domain, task.NIC)
-		lastWhoisDone = time.Now() // a WHOIS request was issued; pace the next one off this
+		lastWhoisDone = time.Now()           // a WHOIS request was issued; pace the next one off this
 		if qerr != nil && ctx.Err() != nil { // Ctrl+C during the query
 			return false, false
 		}
@@ -554,6 +596,27 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 			fmt.Fprintf(logFile, "%s is available\n", domain)
 			logFile.Flush()
 			persist(state.StatusAvailable, "")
+		} else if hasMark(resp, "redemptionperiod") {
+			// EPP redemptionPeriod: still registered but in the 30-day
+			// redemption grace period. It cannot be re-registered right
+			// now, but will drop if the current owner does not restore it.
+			printf("%s is in redemption period (NOT available)", domain)
+			if w := expiringOpen(); w != nil {
+				fmt.Fprintf(w, "%s is in redemption period (NOT available)\n", domain)
+				w.Flush()
+				expiringHasContent = true
+			}
+			persist(state.StatusRedemption, "")
+		} else if hasMark(resp, "pendingdelete") {
+			// EPP pendingDelete: final ~5 days before the domain drops and
+			// becomes registerable again.
+			printf("%s is pending delete (NOT available)", domain)
+			if w := expiringOpen(); w != nil {
+				fmt.Fprintf(w, "%s is pending delete (NOT available)\n", domain)
+				w.Flush()
+				expiringHasContent = true
+			}
+			persist(state.StatusPendingDelete, "")
 		} else {
 			printf("%s is NOT available", domain)
 			persist(state.StatusUnavailable, "")
@@ -623,10 +686,11 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	if interrupted {
 		printf(separator)
 		printf("****Task Interrupted (progress saved)****")
-		printf("Progress: %d/%d checked — %d available (%d uncertain-dns), %d NOT available (%d dns), %d failed, %d remaining",
+		printf("Progress: %d/%d checked — %d available (%d uncertain-dns), %d NOT available (%d dns, %d redemption, %d pending-delete), %d failed, %d remaining",
 			counts.Checked, task.Total,
 			counts.Available+counts.AvailableDNS, counts.AvailableDNS,
-			counts.Unavailable+counts.UnavailableDNS, counts.UnavailableDNS,
+			counts.Unavailable+counts.UnavailableDNS+counts.Redemption+counts.PendingDelete,
+			counts.UnavailableDNS, counts.Redemption, counts.PendingDelete,
 			counts.Failed, counts.Failed+counts.Pending)
 		printf("Resume later with: -resume=%s", task.MetaPath())
 		return ErrInterrupted
@@ -635,11 +699,22 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 	fmt.Fprintln(logFile, separator+" Task Done")
 	logFile.Flush()
 
+	// The expiring log gets the same footer when the scan completed. The
+	// file may exist from a previous session even if no verdict was found
+	// in this one, hence the has-content check rather than writer != nil.
+	if expiringW != nil || expiringHasContent {
+		if w := expiringOpen(); w != nil {
+			fmt.Fprintln(w, separator+" Task Done")
+			w.Flush()
+		}
+	}
+
 	printf(separator)
-	printf("Task Done: %d domains — %d available (%d uncertain-dns), %d NOT available (%d via-dns), %d failed",
+	printf("Task Done: %d domains — %d available (%d uncertain-dns), %d NOT available (%d via-dns, %d redemption, %d pending-delete), %d failed",
 		task.Total,
 		counts.Available+counts.AvailableDNS, counts.AvailableDNS,
-		counts.Unavailable+counts.UnavailableDNS, counts.UnavailableDNS,
+		counts.Unavailable+counts.UnavailableDNS+counts.Redemption+counts.PendingDelete,
+		counts.UnavailableDNS, counts.Redemption, counts.PendingDelete,
 		counts.Failed)
 	if task.Done() {
 		// Nothing left to resume: remove the checkpoint files entirely.
@@ -696,6 +771,13 @@ func jitteredDelay(base time.Duration) time.Duration {
 	spread := base / 4
 	low := base - spread
 	return low + time.Duration(rand.Int64N(int64(2*spread)+1))
+}
+
+// hasMark reports whether the WHOIS response contains the given marker
+// string, case-insensitively: EPP status codes like "redemptionPeriod" and
+// plain text like "Redemption Period" both match "redemptionperiod".
+func hasMark(resp, mark string) bool {
+	return strings.Contains(strings.ToLower(resp), strings.ToLower(mark))
 }
 
 func openLog(path string) (*os.File, error) {

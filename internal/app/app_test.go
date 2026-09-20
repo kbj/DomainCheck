@@ -182,6 +182,89 @@ func soleStatePath(t *testing.T, dir string) string {
 	return matches[0]
 }
 
+// TestRedemptionAndPendingDeleteDetected covers the expiry-phase verdicts:
+// WHOIS responses carrying the EPP status codes redemptionPeriod and
+// pendingDelete must be recognized and shown distinctly instead of a
+// generic "is NOT available". These domains sit in the deletion pipeline:
+// still registered (never "available") but worth surfacing to the operator.
+func TestRedemptionAndPendingDeleteDetected(t *testing.T) {
+	dir := setupDataDir(t)
+	opts, _ := testOptions(t, dir, func(d string) string {
+		switch d {
+		case "abc.xyz": // Verisign-style EPP code response
+			return d + "\nDomain Status: redemptionPeriod https://icann.org/epp#redemptionPeriod\n"
+		case "bcd.xyz":
+			return d + "\nDomain Status: pendingDelete https://icann.org/epp#pendingDelete\n"
+		}
+		return d + "\nRegistrar: someone\n" // plain unavailable
+	})
+
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	out := opts.Stdout.(*bytes.Buffer).String()
+	for _, want := range []string{
+		"abc.xyz is in redemption period (NOT available)",
+		"bcd.xyz is pending delete (NOT available)",
+		"cde.xyz is NOT available",
+		// summary: redemption and pending-delete counted separately
+		"3 NOT available (0 via-dns, 1 redemption, 1 pending-delete), 0 failed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout missing %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "abc.xyz is available") || strings.Contains(out, "bcd.xyz is available") {
+		t.Fatalf("expiry-phase domains must never be shown as available:\n%s", out)
+	}
+
+	// Two result logs: the available-only main log plus the dedicated
+	// expiring log for redemption / pending-delete domains.
+	logMatches, _ := filepath.Glob(filepath.Join(dir, "result", "*.log"))
+	if len(logMatches) != 2 {
+		t.Fatalf("expected main log + expiring log, got %v", logMatches)
+	}
+	var mainLog string
+	for _, p := range logMatches {
+		if !strings.HasSuffix(p, ".expiring.log") {
+			mainLog = p
+		}
+	}
+	logBytes, _ := os.ReadFile(mainLog)
+	if strings.Contains(string(logBytes), "redemption") || strings.Contains(string(logBytes), "NOT available") {
+		t.Fatalf("result log must stay available-only:\n%s", logBytes)
+	}
+
+	// The expiring log records both verdicts apart from the main log,
+	// with the original-format header and a Task Done footer.
+	expMatches, _ := filepath.Glob(filepath.Join(dir, "result", "*.expiring.log"))
+	if len(expMatches) != 1 {
+		t.Fatalf("expected exactly one expiring log, got %v", expMatches)
+	}
+	expBytes, _ := os.ReadFile(expMatches[0])
+	exp := string(expBytes)
+	for _, want := range []string{
+		"TLD: xyz Dict: test Delay: 0 Time: ",
+		"abc.xyz is in redemption period (NOT available)\n",
+		"bcd.xyz is pending delete (NOT available)\n",
+		" Task Done",
+	} {
+		if !strings.Contains(exp, want) {
+			t.Fatalf("expiring log missing %q:\n%s", want, exp)
+		}
+	}
+	if strings.Contains(exp, "is available\n") {
+		t.Fatalf("expiring log must not record available domains:\n%s", exp)
+	}
+
+	// A fully-judged run leaves no checkpoints behind.
+	leftover, _ := filepath.Glob(filepath.Join(dir, "state", "*"))
+	if len(leftover) != 0 {
+		t.Fatalf("completed task must delete its checkpoints, left: %v", leftover)
+	}
+}
+
 func TestEndToEndFullRun(t *testing.T) {
 	dir := setupDataDir(t)
 	available := map[string]bool{"abc.xyz": true, "cde.xyz": true}
@@ -215,7 +298,7 @@ func TestEndToEndFullRun(t *testing.T) {
 	if len(leftover) != 0 {
 		t.Fatalf("completed task must delete its checkpoints, left: %v", leftover)
 	}
-	if !strings.Contains(out, "Task Done: 3 domains — 2 available (0 uncertain-dns), 1 NOT available (0 via-dns), 0 failed") {
+	if !strings.Contains(out, "Task Done: 3 domains — 2 available (0 uncertain-dns), 1 NOT available (0 via-dns, 0 redemption, 0 pending-delete), 0 failed") {
 		t.Fatalf("summary mismatch:\n%s", out)
 	}
 
@@ -490,6 +573,74 @@ func TestInterruptSavesProgressAndResumes(t *testing.T) {
 	}
 }
 
+// TestExpiringLogResumeKeepsSingleHeader covers the cross-session behavior:
+// an expiring entry recorded in the first (interrupted) session must not get
+// a second header on resume, and the Task Done footer must still be
+// appended by the resuming session.
+func TestExpiringLogResumeKeepsSingleHeader(t *testing.T) {
+	dir := setupDataDir(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// bcd (index 1) gets a pendingDelete verdict and is recorded; cancel
+	// as soon as the THIRD domain arrives so the run is interrupted after
+	// the expiring log already has content.
+	opts, _ := testOptions(t, dir, func(d string) string {
+		if d == "cde.xyz" {
+			cancel() // simulate Ctrl+C right when cde is being queried
+			time.Sleep(10 * time.Millisecond)
+		}
+		if d == "bcd.xyz" {
+			return d + "\nDomain Status: pendingDelete https://icann.org/epp#pendingDelete\n"
+		}
+		return d + "\nRegistrar: someone\n"
+	})
+
+	err := Run(ctx, opts)
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("want ErrInterrupted, got %v", err)
+	}
+
+	statePath := soleStatePath(t, dir) // progress must already be on disk
+	tk, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tk.CloseJournal()
+	c, err := tk.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PendingDelete != 1 || c.Pending < 1 {
+		t.Fatalf("bcd must be pending-delete and cde unchecked: %+v", c)
+	}
+
+	// Resume without cancelling: finishes cde, footer appended, single header.
+	resumeOpts := opts
+	resumeOpts.Resume = statePath
+	resumeOpts.Stdout = &bytes.Buffer{}
+	if err := Run(context.Background(), resumeOpts); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	expMatches, _ := filepath.Glob(filepath.Join(dir, "result", "*.expiring.log"))
+	if len(expMatches) != 1 {
+		t.Fatalf("expected exactly one expiring log, got %v", expMatches)
+	}
+	expBytes, _ := os.ReadFile(expMatches[0])
+	exp := string(expBytes)
+	if got := strings.Count(exp, "TLD: xyz"); got != 1 {
+		t.Fatalf("expiring log must keep a single header across resume, got %d:\n%s", got, exp)
+	}
+	if got := strings.Count(exp, "pending delete (NOT available)"); got != 1 {
+		t.Fatalf("expiring log must hold exactly one entry, got %d:\n%s", got, exp)
+	}
+	if !strings.Contains(exp, " Task Done") {
+		t.Fatalf("resuming session must append the Task Done footer:\n%s", exp)
+	}
+}
+
 func TestInteractiveFlow(t *testing.T) {
 	dir := setupDataDir(t)
 	opts, _ := testOptions(t, dir, func(d string) string {
@@ -588,7 +739,7 @@ func TestDNSPreCheckSkipsWhois(t *testing.T) {
 		t.Fatalf("dns-derived results must be tagged:\n%s", out)
 	}
 
-	if !strings.Contains(out, "Task Done: 3 domains") || !strings.Contains(out, "(2 via-dns)") {
+	if !strings.Contains(out, "Task Done: 3 domains") || !strings.Contains(out, "(2 via-dns, 0 redemption, 0 pending-delete)") {
 		t.Fatalf("summary should count dns results:\n%s", out)
 	}
 	leftover, _ := filepath.Glob(filepath.Join(dir, "state", "*"))
@@ -627,7 +778,7 @@ func TestUnconfiguredTLDRunsDNSOnly(t *testing.T) {
 		}
 	}
 
-	if !strings.Contains(out, "Task Done: 3 domains") || !strings.Contains(out, "(1 via-dns)") {
+	if !strings.Contains(out, "Task Done: 3 domains") || !strings.Contains(out, "(1 via-dns, 0 redemption, 0 pending-delete)") {
 		t.Fatalf("dns-only summary expected:\n%s", out)
 	}
 }

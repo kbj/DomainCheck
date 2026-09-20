@@ -56,6 +56,10 @@ type Options struct {
 	// workers block instead of ballooning memory on huge dictionaries.
 	// Zero falls back to DefaultWhoisQueue.
 	WhoisQueue int
+
+	// NoProgress disables the bottom-line progress bar. The bar is only
+	// drawn on a TTY to begin with; this flag forces it off unconditionally.
+	NoProgress bool
 	// ForceDNSOnly skips WHOIS entirely; set interactively after the user
 	// confirms an unconfigured TLD.
 	ForceDNSOnly bool
@@ -477,6 +481,48 @@ func runLoop(ctx context.Context, opts Options, task *state.Task,
 		printf("[!] Registered-but-undelegated domains look available under this mode.")
 	}
 	printf(separator)
+
+	// Bottom-line progress bar: only active on a TTY (tests/redirects get
+	// a nil renderer that renders nothing). Verdict printing wraps it:
+	// erase the bar line, print the verdict, let the ticker redraw it.
+	var progress *progressRenderer
+	if !opts.NoProgress {
+		progress = newProgressRenderer(opts.Stdout)
+		progress.setTotal(task.Total)
+		progress.render(task.CheckedCount()) // first frame
+		printUnderProgress := printf
+		printf = func(format string, args ...any) {
+			progress.Close() // clear the bottom line before printing over it
+			printUnderProgress(format, args...)
+		}
+	}
+	// Ticker redraws while the scan runs (rate/ETA move without new
+	// verdicts during WHOIS backoff sleeps, too). progressStop ends it —
+	// ctx cancellation alone cannot: scans run on context.Background()
+	// when not interrupted.
+	progressStop := make(chan struct{})
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// render is nil-safe; CheckedCount is state-mutex-safe.
+				progress.render(task.CheckedCount())
+			}
+		}
+	}()
+	defer func() {
+		close(progressStop) // stop the ticker first...
+		<-progressDone      // ...then reap the goroutine
+		progress.Close()    // erase the bottom line (no-op when nothing drawn)
+	}()
 
 	interrupted := false
 	degradedAnnounced := false

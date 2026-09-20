@@ -48,6 +48,7 @@ func main() {
 		dnsInterval = flag.Duration("dns-interval", time.Second, "per-worker pause between DNS pre-checks / DNS retry backoff base (min 100ms)")
 		dnsWorkers  = flag.Int("dns-concurrency", dns.DefaultConcurrency, "parallel DNS NS pre-checks (two-queue pipeline; WHOIS pacing untouched; 1 = serial)")
 		whoisQueue  = flag.Int("whois-queue", app.DefaultWhoisQueue, "max domains waiting for the serial WHOIS consumer (backpressure valve)")
+		noProgress  = flag.Bool("no-progress", false, "disable the bottom-line progress bar (auto-disabled for redirected output anyway)")
 		maxBackoff  = flag.Duration("max-backoff", whois.DefaultMaxDelay, "upper bound for both retry backoffs")
 		forceWhois  = flag.Bool("force-whois", false, "on resume, re-enable WHOIS for a task that had degraded to DNS-only mode")
 		showVersion = flag.Bool("version", false, "print version and exit")
@@ -99,6 +100,7 @@ func main() {
 		Concurrency: *dnsWorkers,
 	}
 	opts.WhoisQueue = *whoisQueue
+	opts.NoProgress = *noProgress
 
 	// Interactive when the user gave no task-defining flags, mirroring the
 	// Python behavior of just running `python3 GetDomain.py`.

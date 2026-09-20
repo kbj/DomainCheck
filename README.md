@@ -139,6 +139,7 @@ de.xyz is pending delete (NOT available) #待删除期（EPP pendingDelete）
 | `-dns-interval` | 每个 DNS worker 两次预检之间的固定间隔（per-worker 语义，N 个 worker ≈ N 倍 DNS 吞吐），同时作为 DNS 重试退避基数（默认 1s，最小可设 0.1s） |
 | `-dns-concurrency` | DNS NS 预检的并行 worker 数（默认 5）；设 1 恢复完全串行；只影响 DNS 侧吞吐，WHOIS 节奏不变 |
 | `-whois-queue` | 串行 WHOIS 消费者前的等待队列上限（默认 512），即背压阀门：队列满时 DNS 预检 worker 阻塞，内存不随字典规模增长 |
+| `-no-progress` | 关闭底部实时进度条（默认开启；重定向输出时进度条自动禁用，日志不受影响） |
 | `-max-backoff` | 两类重试等待的上限（默认 60s） |
 | `-force-whois` | 续扫时重新启用 WHOIS：针对曾因反爬耗尽重试而降级为 DNS-only 的任务，清降级标记后重新走 WHOIS（仅当该后缀在 `tld.json` 中有 WHOIS 配置时生效） |
 | `-dns` | 自定义 DNS 解析器（NS 预检用），逗号分隔多个；条目格式见下文「DNS 解析器配置」 |

@@ -552,3 +552,66 @@ func TestResumableFindsIncompleteNewestFirst(t *testing.T) {
 		t.Fatalf("wrong task: %+v", tasks[0])
 	}
 }
+
+// TestStaleFailedEntryDoesNotZombieTask covers a crash window that used to
+// leave a task permanently unfinished: the journal already holds a
+// conclusive record for index i while the meta file still lists i as failed
+// (the process died inside SaveMeta's journal-flush -> meta-rename window,
+// or i was retried successfully after the failure had been persisted).
+//
+// Done() must be true afterwards: a leftover failure entry would keep the
+// checkpoints alive forever, make every resume re-scan the whole task, and
+// let Done()/CheckedCount()/Counts() disagree (the observed "4 of 3 checked").
+func TestStaleFailedEntryDoesNotZombieTask(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "x.state.json")
+	tk, err := New(Config{
+		TLD: "xyz", DictName: "d", DictPath: filepath.Join(dir, "d"),
+		StatePath: statePath, JournalPath: filepath.Join(dir, "x.journal"), Total: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Record(0, "a.xyz", StatusAvailable, "", 1)
+	tk.SaveMeta()
+	tk.Record(1, "b.xyz", StatusFailed, "boom", 1) // failed once: lands in the meta file
+	if err := tk.SaveMeta(); err != nil {
+		t.Fatal(err)
+	}
+	// Stale meta snapshot: exactly what the crash window leaves on disk.
+	stale, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stale), "\"b.xyz\"") {
+		t.Fatalf("precondition: stale meta must list the failure:\n%s", stale)
+	}
+	tk.Record(1, "b.xyz", StatusAvailable, "", 2) // retry succeeded: journal is ahead now
+	tk.Record(2, "c.xyz", StatusUnavailable, "", 1)
+	tk.CloseJournal()
+
+	// Simulate the crash: rewind only the meta file to that snapshot, leaving
+	// the journal (the authority) intact.
+	if err := os.WriteFile(statePath, stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.CloseJournal()
+	if len(got.Failed) != 0 {
+		t.Fatalf("stale failure must be dropped: %+v", got.Failed)
+	}
+	if !got.Done() {
+		t.Fatalf("task must be done after the journal settled every index: progress=%d failed=%d cursor=%d",
+			got.Progress, len(got.Failed), got.Cursor())
+	}
+	if n := got.CheckedCount(); n != 3 {
+		t.Fatalf("CheckedCount=%d, want 3 (never more than Total)", n)
+	}
+	if c, cerr := got.Counts(); cerr != nil || c.Failed != 0 || c.Pending != 0 || c.Checked != 3 {
+		t.Fatalf("counts=%+v err=%v, want 3 checked / 0 failed / 0 pending", c, cerr)
+	}
+}

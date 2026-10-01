@@ -27,7 +27,12 @@
 // persisted — the journal is the authoritative history and Settled is
 // rebuilt from it on Load, keeping the meta file O(#failures) small and
 // making progress self-healing after a crash (whatever the journal holds
-// is exactly what is settled).
+// is exactly what is settled). The same replay drops failure entries the
+// journal has already settled: a meta file may lag the journal by one
+// rewrite (crash inside SaveMeta's flush->rename window, or a retry that
+// succeeded after its failure was persisted), and keeping such an entry
+// would make Done() permanently false — a zombie checkpoint that every
+// resume re-scans and never deletes.
 //
 // Memory usage of the persisted state is O(1) w.r.t. dictionary size (plus
 // the O(#failures) list); the caller's prefix slice and the in-memory
@@ -304,6 +309,11 @@ func (t *Task) CheckedCount() int {
 	for _, s := range t.Settled {
 		n += int(s)
 	}
+	// Clamp: a stale meta file could claim more failures than Total, and the
+	// caller prints this as "checked x/y" (never report x > y).
+	if n+len(t.Failed) > t.Total {
+		return t.Total
+	}
 	return n + len(t.Failed)
 }
 
@@ -331,7 +341,11 @@ func (t *Task) JournalPath() string { return t.journalPath }
 // Done reports whether every domain has been conclusively checked: the
 // settled bitmap is full (no retryable failure outstanding) and no failure
 // entry remains.
-func (t *Task) Done() bool { return t.Progress == t.Total && len(t.Failed) == 0 }
+func (t *Task) Done() bool {
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
+	return t.Progress == t.Total && len(t.Failed) == 0
+}
 
 // Counts tallies outcomes. Available/unavailable come from streaming the
 // journal (O(1) memory); pending is derived.
@@ -350,6 +364,11 @@ type Counts struct {
 // Counts streams the journal to compute exact per-status tallies using one
 // byte of memory per dictionary entry (e.g. ~1 MB for a million domains).
 func (t *Task) Counts() (Counts, error) {
+	// Serialize against concurrent Record/SaveMeta (DNS workers and the
+	// WHOIS consumer): Failed is read outside settledMu everywhere else, but
+	// this one streams the journal and must not race with a writer's flush.
+	t.settledMu.Lock()
+	defer t.settledMu.Unlock()
 	c := Counts{Failed: len(t.Failed)}
 	if err := t.journalFlush(); err != nil {
 		return c, err
@@ -588,6 +607,22 @@ func loadV3(path string, data []byte) (*Task, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("state: %s: read journal: %w", path, err)
+	}
+	// The journal is the authority: a failed entry whose index already has a
+	// conclusive record is a stale meta file (e.g. the process was killed
+	// inside SaveMeta's flush->rename window, or a retry succeeded after the
+	// failure was persisted). Keeping it would leave the task permanently
+	// unfinished — Done() would never be true, so the checkpoints would
+	// survive every resume and Done()/CheckedCount()/Counts() could disagree
+	// (the observed '4 of 3 checked'). Out-of-range entries are dropped too:
+	// a meta file from another dictionary must not crash the rebuild.
+	if kept := t.Failed[:0]; len(t.Failed) > 0 {
+		for _, fe := range t.Failed {
+			if fe.Index >= 0 && fe.Index < t.Total && t.Settled[fe.Index] == 0 {
+				kept = append(kept, fe)
+			}
+		}
+		t.Failed = kept
 	}
 	t.recount()
 	return t, nil
